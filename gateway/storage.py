@@ -88,6 +88,34 @@ MIGRATIONS: list[tuple[int, tuple[str, ...]]] = [
         "CREATE INDEX IF NOT EXISTS audit_log_ts ON audit_log(ts)",
         "CREATE INDEX IF NOT EXISTS audit_log_action ON audit_log(action, ts)",
     )),
+    (3, (
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id TEXT PRIMARY KEY,
+            username TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL CHECK (role IN ('admin', 'member', 'viewer')),
+            status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'disabled')),
+            created_at TEXT NOT NULL,
+            last_seen_at TEXT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS auth_sessions (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL REFERENCES users(id),
+            token_hash TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            ip TEXT,
+            user_agent TEXT,
+            revoked_at TEXT
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS auth_sessions_user ON auth_sessions(user_id)",
+        "CREATE INDEX IF NOT EXISTS auth_sessions_token ON auth_sessions(token_hash)",
+    )),
 ]
 
 
@@ -327,6 +355,86 @@ class Store:
         with self.connect() as db:
             rows = db.execute(query, parameters).fetchall()
         return [dict(row) for row in rows]
+
+    # ------------------------------------------------------- 账号与会话
+
+    def count_users(self) -> int:
+        with self.connect() as db:
+            return int(db.execute("SELECT COUNT(*) FROM users").fetchone()[0])
+
+    def create_user(self, username: str, password_hash: str, role: str = "member") -> dict:
+        user = dict(id=uuid4().hex, username=username, password_hash=password_hash,
+                    role=role, status="active", created_at=now(), last_seen_at=None)
+        with self.connect() as db:
+            db.execute("""
+                INSERT INTO users (id, username, password_hash, role, status, created_at, last_seen_at)
+                VALUES (:id, :username, :password_hash, :role, :status, :created_at, :last_seen_at)
+            """, user)
+        return user
+
+    def find_user(self, *, username: str | None = None,
+                  user_id: str | None = None) -> dict | None:
+        query, parameter = ("SELECT * FROM users WHERE username = ?", username) \
+            if username is not None else ("SELECT * FROM users WHERE id = ?", user_id)
+        with self.connect() as db:
+            row = db.execute(query, (parameter,)).fetchone()
+        return dict(row) if row else None
+
+    def list_users(self, limit: int = 100, offset: int = 0) -> list[dict]:
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT id, username, role, status, created_at, last_seen_at"
+                " FROM users ORDER BY created_at LIMIT ? OFFSET ?", (limit, offset)
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def update_user(self, user_id: str, *, password_hash: str | None = None,
+                    role: str | None = None, status: str | None = None) -> dict:
+        changes = {column: value for column, value in
+                   (("password_hash", password_hash), ("role", role), ("status", status))
+                   if value is not None}
+        with self.connect() as db:
+            if self._row(db, "SELECT 1 FROM users WHERE id = ?", user_id) is None:
+                raise GatewayError(404, "user_not_found", "用户不存在。")
+            if changes:
+                assignments = ", ".join(f"{column} = :{column}" for column in changes)
+                db.execute(f"UPDATE users SET {assignments} WHERE id = :id",
+                           {**changes, "id": user_id})
+            row = db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        return dict(row)
+
+    def create_auth_session(self, session: dict) -> None:
+        with self.connect() as db:
+            db.execute("""
+                INSERT INTO auth_sessions (id, user_id, token_hash, created_at, expires_at,
+                                           last_seen_at, ip, user_agent, revoked_at)
+                VALUES (:id, :user_id, :token_hash, :created_at, :expires_at,
+                        :last_seen_at, :ip, :user_agent, NULL)
+            """, session)
+
+    def find_auth_session(self, token_hash: str) -> dict | None:
+        with self.connect() as db:
+            row = db.execute("""
+                SELECT auth_sessions.*, users.username, users.role, users.status AS user_status
+                FROM auth_sessions JOIN users ON users.id = auth_sessions.user_id
+                WHERE auth_sessions.token_hash = ?
+            """, (token_hash,)).fetchone()
+        return dict(row) if row else None
+
+    def touch_auth_session(self, session_id: str, last_seen: str) -> None:
+        with self.connect() as db:
+            db.execute("UPDATE auth_sessions SET last_seen_at = ? WHERE id = ?",
+                       (last_seen, session_id))
+
+    def revoke_auth_session(self, session_id: str) -> None:
+        with self.connect() as db:
+            db.execute("UPDATE auth_sessions SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
+                       (now(), session_id))
+
+    def revoke_user_sessions(self, user_id: str) -> None:
+        with self.connect() as db:
+            db.execute("UPDATE auth_sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL",
+                       (now(), user_id))
 
     @staticmethod
     def _row(db: sqlite3.Connection, query: str, *parameters: object) -> sqlite3.Row | None:

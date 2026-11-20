@@ -425,17 +425,35 @@ remaining   = budget − fixed − notice
    用户可见的只有 Gateway token      模型密钥只存在于服务端进程
 ```
 
-两种准入方式：
+两种准入方式（`legacy` 模式）：
 
 | 场景 | 凭证 | 校验点 |
 | --- | --- | --- |
 | HTTP 业务接口 | `Authorization: Bearer <GATEWAY_TOKEN>` | `require_auth`（依赖注入） |
-| WS（Python 等客户端） | 同上，握手头 | `authorized(websocket.headers["authorization"])` |
-| WS（浏览器） | `?ticket=<一次性票据>` | `accepts_ticket`（取出即作废） |
+| WS（Python 等客户端） | 同上，握手头 | `token_matches` / `legacy_open` |
+| WS（浏览器） | `?ticket=<一次性票据>` | `websocket_principal`（取出即作废） |
 
 - 比较用 `secrets.compare_digest`，避免按字节提前返回。
-- `GATEWAY_TOKEN` 为空表示**关闭校验**，仅适合本机；`run.py` 在监听非回环地址时会强制要求它。
-- 内置页面与 `/health` 不需要 token（页面只是外壳，`/health` 只回 `provider` 和 `auth_required`）。
+- `GATEWAY_TOKEN` 为空且为 `legacy` 模式表示**关闭校验**，仅适合本机；`run.py` 在监听非回环地址时要求本地认证或 token。
+- 内置页面与 `/health` 不需要凭据（页面只是外壳，`/health` 只回 `provider` 和 `auth_required`）。
+
+### 8.1b 本地认证（`GATEWAY_AUTH_MODE=local`）
+
+多人使用时改用本地账号：
+
+```text
+浏览器 → POST /login（表单）→ 校验 scrypt 哈希
+       → 生成 32 字节随机 token，DB 只存 SHA-256
+       → Set-Cookie: ydd_session（HttpOnly; SameSite=Lax; Secure?）
+       → 后续请求：Cookie → 会话行 → 用户（检查吊销、空闲/绝对过期）
+脚本   → Authorization: Bearer <GATEWAY_TOKEN>（映射为管理员，过渡期兼容）
+```
+
+- **密码**：stdlib `hashlib.scrypt`（n=2^14, r=8, p=1，16 字节盐）；用户不存在时也跑一次哈希防枚举。
+- **会话**：不透明 token，服务端可吊销；登出/重置密码立即失效；`last_seen_at` 最多每 60 秒写一次。
+- **CSRF**：Cookie 认证的非幂等请求校验 `Origin` / `Sec-Fetch-Site`（同源放行，跨站 `403 csrf_rejected`）；Bearer 不受影响。
+- **限速**：按 `(IP, 用户名)` 计数，超过阈值锁定；失败写入审计。
+- 认证顺序：Cookie 会话 → 共享 token；WS 额外保留票据（浏览器取票仍可用，但 Cookie 已足够）。
 
 ### 8.2 票据生命周期
 

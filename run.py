@@ -21,8 +21,9 @@ def main() -> None:
         app = create_app(settings, log_settings)
     except ValueError as error:
         parser.error(str(error))
-    if args.host not in {"127.0.0.1", "localhost", "::1"} and not settings.gateway_token:
-        parser.error("对外监听前请在 .env 中设置 GATEWAY_TOKEN。")
+    if args.host not in {"127.0.0.1", "localhost", "::1"} \
+            and not settings.gateway_token and settings.auth_mode != "local":
+        parser.error("对外监听前请启用本地认证（GATEWAY_AUTH_MODE=local）或设置 GATEWAY_TOKEN。")
     runtime = setup_logging(log_settings)
     try:
         # log_config=None：日志格式与去向完全由我们接管（含 access 日志的脱敏）。

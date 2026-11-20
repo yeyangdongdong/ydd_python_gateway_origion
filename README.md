@@ -316,6 +316,13 @@ Agent、会话、消息和运行记录均保存在 SQLite。成功后，助手�
 | `GATEWAY_LOG_MAX_BYTES` | `52428800` | 单个日志文件大小上限，超出后追加序号 |
 | `GATEWAY_LOG_BACKUP_DAYS` | `30` | 普通日志保留天数 |
 | `GATEWAY_AUDIT_BACKUP_DAYS` | `180` | 审计日志保留天数 |
+| `GATEWAY_AUTH_MODE` | `legacy` | `legacy` 只认共享 token；`local` 启用本地账号 + 会话 Cookie |
+| `GATEWAY_SESSION_IDLE_SECONDS` | `28800` | 会话空闲过期时间 |
+| `GATEWAY_SESSION_ABSOLUTE_SECONDS` | `604800` | 会话绝对过期时间 |
+| `GATEWAY_COOKIE_SECURE` | `false` | 走 HTTPS 时设为 `true`（Cookie 加 `Secure`） |
+| `GATEWAY_LOGIN_MAX_FAILURES` | `5` | 同 IP+账号连续失败多少次后锁定 |
+| `GATEWAY_LOGIN_WINDOW_SECONDS` | `300` | 失败计数窗口 |
+| `GATEWAY_LOGIN_LOCK_SECONDS` | `900` | 锁定时长 |
 
 `run.py` 默认只监听 `127.0.0.1:8000`。需要局域网访问时，先设置非空 `GATEWAY_TOKEN`，再运行 `python run.py --host 0.0.0.0`；跨不可信网络应通过 HTTPS/WSS 反向代理或受保护的隧道访问。不要把 `.env` 或数据库提交到代码仓库。
 
@@ -334,12 +341,15 @@ ydd_python_gateway_origion/
 │   ├── access_log.py           # 访问日志中间件与参数脱敏
 │   ├── logging_setup.py        # JSON 格式化、按类别/服务分文件、异步写盘
 │   ├── audit.py                # 审计双写（数据库 + 文件）
+│   ├── auth.py                 # 密码哈希、会话 token、登录限速
+│   ├── admin.py                # 命令行管理用户（python -m gateway.admin）
 │   ├── storage.py              # SQLite 表、迁移和读写操作
 │   ├── tickets.py              # 浏览器连接 WebSocket 用的一次性票据
 │   ├── config.py               # 配置加载和检查
 │   └── errors.py               # 共用错误类型
 ├── web/
-│   └── chat.html               # 内置浏览器聊天页（无外部依赖）
+│   ├── chat.html               # 内置浏览器聊天页（无外部依赖）
+│   └── login.html              # 登录页（local 认证模式）
 ├── docs/                       # 技术文档：架构、接口、决策、开发
 ├── docs/proposals/             # 尚未实现的设计提案（健康检查已实现）
 ├── examples/                   # HTTP、WebSocket 与管理接口示例
@@ -507,7 +517,50 @@ GET /audit?limit=100&offset=0&action=agent.delete&result=ok
 
 审计写入是**旁路**：写库失败只记 ERROR，不会让业务请求失败；需要强合规时把 `audit` 日志采集到外部 WORM / SIEM，网关自身无法提供防篡改。审计文件保留期由 `GATEWAY_AUDIT_BACKUP_DAYS` 控制（默认 180 天）。
 
-## 12. 基础版范围
+## 12. 用户与认证（局域网多人）
+
+默认 `GATEWAY_AUTH_MODE=legacy`：所有客户端共享一个 `GATEWAY_TOKEN`，适合本机或单人使用。
+多人/局域网使用时改成 `local`：
+
+```dotenv
+GATEWAY_AUTH_MODE=local
+GATEWAY_COOKIE_SECURE=false     # 走 HTTPS 时设为 true
+```
+
+### 创建第一个管理员
+
+```powershell
+.\.venv\Scripts\python.exe -m gateway.admin create-user --username admin --admin
+.\.venv\Scripts\python.exe -m gateway.admin list-users
+.\.venv\Scripts\python.exe -m gateway.admin reset-password --username admin
+```
+
+密码用标准库 `scrypt` 加盐哈希（不落明文），至少 10 位；管理员之后可以创建 `member` / `viewer`。
+
+### 登录与会话
+
+- 浏览器打开 <http://127.0.0.1:8000/login> 登录；成功后写入 `ydd_session` Cookie（`HttpOnly; SameSite=Lax`，HTTPS 下加 `Secure`）；
+- 会话是**不透明随机串**，数据库只存 SHA-256，库泄露不等于会话泄露；
+- 空闲 8 小时 / 绝对 7 天过期（`GATEWAY_SESSION_*`），登出立即吊销；`reset-password` 会踢掉该用户所有会话；
+- 同一套账号对聊天页、管理接口和反向代理前缀都生效；
+- **旧 `GATEWAY_TOKEN` 在 local 模式下仍然可用**（映射为管理员），脚本可平滑迁移。
+
+### CSRF 与限速
+
+- Cookie 认证的非幂等请求校验 `Origin` 或 `Sec-Fetch-Site`（跨站返回 `403 csrf_rejected`）；Bearer 请求不受影响；
+- 登录失败按 `(IP, 用户名)` 计数，5 次失败锁定 15 分钟（`GATEWAY_LOGIN_*`），失败事件写入审计；
+- 用户不存在时也执行一次密码哈希，避免通过响应时间枚举用户名。
+
+### 认证相关接口
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/login` | 登录页（仅 local 模式） |
+| POST | `/login` | 表单登录，成功 303 并下发 Cookie |
+| POST | `/logout` | 吊销当前会话并清除 Cookie（需登录，带 CSRF 校验） |
+| GET | `/auth/status` | 当前认证模式与登录用户 |
+
+## 13. 基础版范围
 
 这是独立的简化 Gateway，借鉴 OpenClaw 的职责划分，使用自己的 API。它不能直接替换 OpenClaw Gateway，也不兼容现有 OpenClaw Control UI、CLI、配对和 RPC 协议。
 

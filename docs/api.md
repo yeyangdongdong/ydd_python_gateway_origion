@@ -351,6 +351,18 @@ WS    /finance/live         →  ws://127.0.0.1:9001/live
 {"type":"error","status":502,"error":{"code":"upstream_unreachable","message":"无法连接上游 http://127.0.0.1:9001 的 WebSocket。"}}
 ```
 
+### 2.9 认证（`GATEWAY_AUTH_MODE=local`）
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/login` | 登录页（HTML；legacy 模式返回 404） |
+| POST | `/login` | `application/x-www-form-urlencoded`：`username`、`password`、可选 `next`；成功 303 + `Set-Cookie: ydd_session`，失败 303 到 `/login?error=invalid|locked` |
+| POST | `/logout` | 吊销当前会话并清 Cookie（需登录；Cookie 认证时校验 CSRF 来源） |
+| GET | `/auth/status` | `{"auth_mode","authenticated","user"}`，无需登录 |
+
+登录后的浏览器请求自动携带 Cookie；脚本仍可用 `Authorization: Bearer <GATEWAY_TOKEN>`（映射为管理员）。
+Cookie 认证的非幂等请求（POST/PUT/PATCH/DELETE）需要同源的 `Origin` 或 `Sec-Fetch-Site`，否则 `403 csrf_rejected`。
+
 ## 3. WebSocket 协议
 
 ### 3.1 连接

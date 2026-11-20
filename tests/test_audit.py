@@ -46,7 +46,8 @@ class AuditTests(unittest.TestCase):
             self.assertEqual(event["target"]["type"], "agent")
             self.assertEqual(event["target"]["id"], agent_id)
             self.assertEqual(event["result"], "ok")
-            self.assertEqual(event["actor"]["type"], "token")
+            self.assertEqual(event["actor"]["type"], "legacy")
+            self.assertEqual(event["actor"]["name"], "gateway-token")
             self.assertEqual(event["ip"], "testclient")
             self.assertEqual(event["details"], {"name": "审计助手", "model": "demo"})
 

@@ -47,6 +47,14 @@ class Settings:
     # 可选的反向代理：路由表文件与上游超时。文件不存在表示不启用。
     routes_path: Path = PROJECT_DIR / "routes.json"
     proxy_timeout: float = 30.0
+    # 认证模式：legacy 只认 GATEWAY_TOKEN；local 启用本地账号 + 会话（可同时接受旧 token）。
+    auth_mode: str = "legacy"
+    session_idle_seconds: int = 8 * 3600
+    session_absolute_seconds: int = 7 * 24 * 3600
+    cookie_secure: bool = False
+    login_max_failures: int = 5
+    login_window_seconds: int = 300
+    login_lock_seconds: int = 900
 
     def __post_init__(self) -> None:
         if self.provider not in {"demo", "openai"}:
@@ -70,6 +78,15 @@ class Settings:
                              "否则没有空间容纳系统提示词和历史。")
         if not math.isfinite(self.proxy_timeout) or self.proxy_timeout <= 0:
             raise ValueError("GATEWAY_PROXY_TIMEOUT 必须是大于 0 的有限数字。")
+        if self.auth_mode not in {"legacy", "local"}:
+            raise ValueError("GATEWAY_AUTH_MODE 只能是 legacy 或 local。")
+        for name, value in (("GATEWAY_SESSION_IDLE_SECONDS", self.session_idle_seconds),
+                            ("GATEWAY_SESSION_ABSOLUTE_SECONDS", self.session_absolute_seconds),
+                            ("GATEWAY_LOGIN_MAX_FAILURES", self.login_max_failures),
+                            ("GATEWAY_LOGIN_WINDOW_SECONDS", self.login_window_seconds),
+                            ("GATEWAY_LOGIN_LOCK_SECONDS", self.login_lock_seconds)):
+            if value <= 0:
+                raise ValueError(f"{name} 必须是正整数。")
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -86,9 +103,13 @@ class Settings:
             max_tokens = int(os.getenv("MODEL_MAX_TOKENS", "2048"))
             context_tokens = int(os.getenv("MODEL_CONTEXT_TOKENS", "8192"))
             proxy_timeout = float(os.getenv("GATEWAY_PROXY_TIMEOUT", "30"))
+            idle = int(os.getenv("GATEWAY_SESSION_IDLE_SECONDS", str(8 * 3600)))
+            absolute = int(os.getenv("GATEWAY_SESSION_ABSOLUTE_SECONDS", str(7 * 24 * 3600)))
+            max_failures = int(os.getenv("GATEWAY_LOGIN_MAX_FAILURES", "5"))
+            window = int(os.getenv("GATEWAY_LOGIN_WINDOW_SECONDS", "300"))
+            lock = int(os.getenv("GATEWAY_LOGIN_LOCK_SECONDS", "900"))
         except ValueError as exc:
-            raise ValueError("MODEL_TIMEOUT_SECONDS、GATEWAY_PROXY_TIMEOUT 应为数字，"
-                             "MODEL_MAX_TOKENS 和 MODEL_CONTEXT_TOKENS 应为整数。") from exc
+            raise ValueError("模型与登录相关的数值配置必须为整数/数字。") from exc
         return cls(
             provider=os.getenv("GATEWAY_PROVIDER", "demo").strip().lower(),
             model=os.getenv("MODEL_NAME", "demo").strip(),
@@ -102,4 +123,11 @@ class Settings:
             use_system_proxy=read_flag("MODEL_USE_SYSTEM_PROXY", False),
             routes_path=routes,
             proxy_timeout=proxy_timeout,
+            auth_mode=os.getenv("GATEWAY_AUTH_MODE", "legacy").strip().lower(),
+            session_idle_seconds=idle,
+            session_absolute_seconds=absolute,
+            cookie_secure=read_flag("GATEWAY_COOKIE_SECURE", False),
+            login_max_failures=max_failures,
+            login_window_seconds=window,
+            login_lock_seconds=lock,
         )

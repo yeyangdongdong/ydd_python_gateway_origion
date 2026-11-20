@@ -5,20 +5,24 @@ import logging
 import secrets
 import time
 from contextlib import aclosing, asynccontextmanager, suppress
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated
+from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
 import anyio
 from fastapi import Depends, FastAPI, Header, Query, Request, WebSocket
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError
 from starlette.concurrency import run_in_threadpool
 from starlette.websockets import WebSocketDisconnect
 
 from .access_log import AccessLogMiddleware, log_websocket
 from .audit import AuditTrail
+from .auth import (COOKIE_NAME, DUMMY_HASH, LoginLimiter, hash_token, legacy_principal,
+                   new_session_token, session_principal, verify_password)
 from .config import Settings
 from .errors import GatewayError
 from .logging_setup import TRACE_ID, LogSettings
@@ -36,6 +40,7 @@ SESSION_PAGE = 100
 MESSAGE_PAGE = 1000
 
 CHAT_PAGE = Path(__file__).resolve().parent.parent / "web" / "chat.html"
+LOGIN_PAGE = Path(__file__).resolve().parent.parent / "web" / "login.html"
 
 
 class InputModel(BaseModel):
@@ -80,6 +85,9 @@ def create_app(settings: Settings | None = None,
     store = Store(settings.db_path)
     tickets = TicketStore()
     audit = AuditTrail(store)
+    login_limiter = LoginLimiter(max_failures=settings.login_max_failures,
+                                 window_seconds=settings.login_window_seconds,
+                                 lock_seconds=settings.login_lock_seconds)
     # 启动时就把路由表读进内存：配置写错立刻报错，而不是等第一个请求。
     routes = load_routes(settings.routes_path)
 
@@ -92,6 +100,11 @@ def create_app(settings: Settings | None = None,
                                     details={"version": "0.1.0", "routes": len(routes)})
         except Exception:      # 审计不可用不应阻止服务启动
             logging.getLogger(__name__).exception("Startup audit failed")
+        if settings.auth_mode == "local":
+            users = await run_in_threadpool(store.count_users)
+            if users == 0:
+                logging.getLogger(__name__).warning(
+                    "本地认证已启用但还没有用户：python -m gateway.admin create-user --username <名字> --admin")
         provider = ModelProvider(settings)
         app.state.chat = ChatService(store, provider, settings)
         app.state.proxy = Proxy(routes, settings.proxy_timeout) if routes else None
@@ -111,15 +124,15 @@ def create_app(settings: Settings | None = None,
         app.state.log_settings = log_settings
         app.add_middleware(AccessLogMiddleware, settings=log_settings)
 
-    def authorized(authorization: str | None) -> bool:
+    def token_matches(authorization: str | None) -> bool:
         if not settings.gateway_token:
-            return True
+            return False
         expected = f"Bearer {settings.gateway_token}".encode("utf-8")
         return secrets.compare_digest((authorization or "").encode("utf-8"), expected)
 
-    def accepts_ticket(session_id: str, ticket: str | None) -> bool:
-        # 票据一次性使用，且只对签发时绑定的资源有效。
-        return ticket is not None and tickets.take(ticket) == f"session:{session_id}"
+    def legacy_open() -> bool:
+        """legacy 模式且未设置 token：保持旧行为（本机演示免鉴权）。"""
+        return settings.auth_mode == "legacy" and not settings.gateway_token
 
     def ws_error(session_id: str, error: GatewayError, *, status: int | None = None,
                  **identifiers: str | None) -> dict:
@@ -133,22 +146,88 @@ def create_app(settings: Settings | None = None,
         event.update({key: value for key, value in identifiers.items() if value is not None})
         return event
 
-    async def require_auth(authorization: str | None = Header(default=None)) -> None:
-        if not authorized(authorization):
-            raise GatewayError(401, "unauthorized", "请提供正确的 Authorization: Bearer <token>。")
+    SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+    async def session_from_cookie(token: str | None) -> dict | None:
+        """校验会话 Cookie：签名即哈希，库里只存 hash；同时检查空闲与绝对过期。"""
+        if not token:
+            return None
+        row = await run_in_threadpool(store.find_auth_session, hash_token(token))
+        if row is None or row["revoked_at"] or row["user_status"] != "active":
+            return None
+        now = datetime.now(timezone.utc)
+        if row["expires_at"] <= now.isoformat():
+            await run_in_threadpool(store.revoke_auth_session, row["id"])
+            return None
+        last_seen = datetime.fromisoformat(row["last_seen_at"])
+        if (now - last_seen).total_seconds() > settings.session_idle_seconds:
+            await run_in_threadpool(store.revoke_auth_session, row["id"])
+            return None
+        # 每 60 秒才写一次 last_seen，避免每个请求都产生写事务。
+        if (now - last_seen).total_seconds() > 60:
+            await run_in_threadpool(store.touch_auth_session, row["id"], now.isoformat())
+        return session_principal(row)
+
+    async def authenticate(request: Request, authorization: str | None) -> dict | None:
+        if settings.auth_mode == "legacy":
+            if token_matches(authorization) or legacy_open():
+                return legacy_principal()
+            return None
+        principal = await session_from_cookie(request.cookies.get(COOKIE_NAME))
+        if principal is not None:
+            return principal
+        # 本地模式下旧的共享 token 仍可用（映射为管理员），方便脚本平滑迁移。
+        if token_matches(authorization):
+            return legacy_principal()
+        return None
+
+    def enforce_csrf(request: Request, principal: dict) -> None:
+        """只有 Cookie 认证需要 CSRF；Bearer 头不会被浏览器自动带上。"""
+        if principal["kind"] != "session" or request.method in SAFE_METHODS:
+            return
+        origin = request.headers.get("origin")
+        if origin:
+            if urlsplit(origin).netloc != request.headers.get("host", ""):
+                raise GatewayError(403, "csrf_rejected", "跨站请求被拒绝。")
+            return
+        site = request.headers.get("sec-fetch-site")
+        if site and site not in {"same-origin", "none"}:
+            raise GatewayError(403, "csrf_rejected", "跨站请求被拒绝。")
+
+    async def require_auth(request: Request,
+                           authorization: str | None = Header(default=None)) -> None:
+        principal = await authenticate(request, authorization)
+        if principal is None:
+            raise GatewayError(401, "unauthorized",
+                               "请先登录，或提供正确的 Authorization: Bearer <token>。")
+        enforce_csrf(request, principal)
+        request.state.principal = principal
 
     auth = [Depends(require_auth)]
 
+    async def websocket_principal(websocket: WebSocket, ticket_resource: str) -> dict | None:
+        """WS 准入：Cookie 会话（浏览器）→ Bearer（脚本/旧 token）→ 一次性票据。"""
+        if settings.auth_mode == "local":
+            principal = await session_from_cookie(websocket.cookies.get(COOKIE_NAME))
+            if principal is not None:
+                return principal
+        if legacy_open() or token_matches(websocket.headers.get("authorization")):
+            return legacy_principal()
+        ticket = websocket.query_params.get("ticket")
+        if ticket and tickets.take(ticket) == ticket_resource:
+            return legacy_principal()
+        return None
+
     def audit_context(request: Request) -> dict:
-        """阶段 3 接入用户后，这里会换成真实身份；现在只有 token/anonymous 两种。"""
-        if settings.gateway_token:
-            return {"actor_type": "token", "actor_id": "legacy",
-                    "actor_name": "gateway-token",
-                    "ip": request.client.host if request.client else "",
+        principal = getattr(request.state, "principal", None)
+        ip = request.client.host if request.client else ""
+        if principal:
+            return {"actor_type": principal["kind"],
+                    "actor_id": principal["user_id"] or principal["username"],
+                    "actor_name": principal["username"], "ip": ip,
                     "trace_id": TRACE_ID.get()}
         return {"actor_type": "anonymous", "actor_id": "", "actor_name": "anonymous",
-                "ip": request.client.host if request.client else "",
-                "trace_id": TRACE_ID.get()}
+                "ip": ip, "trace_id": TRACE_ID.get()}
 
     async def record_audit(request: Request, action: str, *, target_type: str = "",
                            target_id: str = "", details: dict | None = None,
@@ -181,9 +260,99 @@ def create_app(settings: Settings | None = None,
 
     @app.get("/health")
     async def health():
-        # auth_required 供页面提示“是否需要填写 token”，不是一个安全边界。
+        # auth_required 供页面提示“是否需要登录”，不是一个安全边界。
         return {"status": "ok", "provider": settings.provider,
-                "auth_required": bool(settings.gateway_token)}
+                "auth_required": settings.auth_mode == "local" or bool(settings.gateway_token)}
+
+    @app.get("/login")
+    async def login_page():
+        if settings.auth_mode != "local":
+            raise GatewayError(404, "not_found", "当前为 legacy 认证模式，不使用登录页。")
+        return FileResponse(LOGIN_PAGE, media_type="text/html",
+                            headers={"Cache-Control": "no-store"})
+
+    def check_login_origin(request: Request) -> None:
+        origin = request.headers.get("origin")
+        if origin and urlsplit(origin).netloc != request.headers.get("host", ""):
+            raise GatewayError(403, "csrf_rejected", "跨站登录请求被拒绝。")
+
+    @app.post("/login")
+    async def login(request: Request):
+        if settings.auth_mode != "local":
+            raise GatewayError(404, "not_found", "当前为 legacy 认证模式，不使用登录。")
+        check_login_origin(request)
+        body = await request.body()
+        form = parse_qs(body.decode("utf-8", "replace"))
+        username = (form.get("username") or [""])[0].strip()
+        password = (form.get("password") or [""])[0]
+        next_path = (form.get("next") or ["/"])[0]
+        if not next_path.startswith("/") or next_path.startswith("//"):
+            next_path = "/"
+        ip = request.client.host if request.client else ""
+
+        retry_after = login_limiter.retry_after(ip, username)
+        if retry_after:
+            await record_audit(request, "auth.login", result="failed", reason="locked",
+                               details={"username": username, "retry_after": retry_after})
+            return RedirectResponse("/login?error=locked", status_code=303)
+
+        user = await run_in_threadpool(store.find_user, username=username)
+        password_ok = await run_in_threadpool(verify_password, password,
+                                              user["password_hash"] if user else DUMMY_HASH)
+        if user is None or user["status"] != "active" or not password_ok:
+            login_limiter.record_failure(ip, username)
+            await record_audit(request, "auth.login", result="failed", reason="invalid",
+                               details={"username": username})
+            return RedirectResponse("/login?error=invalid", status_code=303)
+
+        login_limiter.record_success(ip, username)
+        token = new_session_token()
+        now = datetime.now(timezone.utc)
+        session = {
+            "id": uuid4().hex, "user_id": user["id"], "token_hash": hash_token(token),
+            "created_at": now.isoformat(),
+            "expires_at": (now + timedelta(seconds=settings.session_absolute_seconds)).isoformat(),
+            "last_seen_at": now.isoformat(), "ip": ip,
+            "user_agent": (request.headers.get("user-agent") or "")[:200],
+        }
+        await run_in_threadpool(store.create_auth_session, session)
+        try:
+            await run_in_threadpool(audit.append, action="auth.login", actor_type="user",
+                                    actor_id=user["id"], actor_name=user["username"],
+                                    ip=ip, trace_id=TRACE_ID.get(),
+                                    details={"username": username})
+        except Exception:
+            logging.getLogger(__name__).exception("Login audit failed")
+
+        response = RedirectResponse(next_path, status_code=303)
+        response.set_cookie(COOKIE_NAME, token,
+                            max_age=settings.session_absolute_seconds,
+                            httponly=True, samesite="lax",
+                            secure=settings.cookie_secure, path="/")
+        return response
+
+    @app.post("/logout", dependencies=auth)
+    async def logout(request: Request):
+        token = request.cookies.get(COOKIE_NAME)
+        if token:
+            row = await run_in_threadpool(store.find_auth_session, hash_token(token))
+            if row is not None:
+                await run_in_threadpool(store.revoke_auth_session, row["id"])
+        await record_audit(request, "auth.logout")
+        response = RedirectResponse("/login", status_code=303)
+        response.delete_cookie(COOKIE_NAME, path="/")
+        return response
+
+    @app.get("/auth/status")
+    async def auth_status(request: Request):
+        principal = None
+        if settings.auth_mode == "local":
+            principal = await session_from_cookie(request.cookies.get(COOKIE_NAME))
+        return {"auth_mode": settings.auth_mode,
+                "authenticated": principal is not None,
+                "user": None if principal is None else {
+                    "id": principal["user_id"], "username": principal["username"],
+                    "role": principal["role"]}}
 
     @app.get("/proxy-status", dependencies=auth)
     async def proxy_status():
@@ -328,11 +497,10 @@ def create_app(settings: Settings | None = None,
         trace_id = uuid4().hex[:16]
         started = time.perf_counter()
         close_code = None
-        if not authorized(websocket.headers.get("authorization")):
-            # 浏览器原生 WebSocket 设不了请求头，所以改用一次性票据准入。
-            if not accepts_ticket(session_id, websocket.query_params.get("ticket")):
-                await websocket.close(code=1008)
-                return
+        principal = await websocket_principal(websocket, f"session:{session_id}")
+        if principal is None:
+            await websocket.close(code=1008)
+            return
         await websocket.accept()
         log_websocket("ws.connect", session_id=session_id, trace_id=trace_id,
                       path=websocket.url.path)
@@ -415,12 +583,11 @@ def create_app(settings: Settings | None = None,
 
     def make_ws_forwarder(route):
         async def forward(websocket: WebSocket, path: str) -> None:
-            # 优先用握手头；浏览器带不了头，就用 /proxy-ticket 换来的票据（绑定到这条路径）。
-            if not authorized(websocket.headers.get("authorization")):
-                ticket = websocket.query_params.get("ticket")
-                if not (ticket and tickets.take(ticket) == f"ws:{websocket.url.path}"):
-                    await websocket.close(code=1008)
-                    return
+            # 准入：Cookie 会话 / Bearer / 代理 WS 的一次性票据（绑定到这条路径）。
+            principal = await websocket_principal(websocket, f"ws:{websocket.url.path}")
+            if principal is None:
+                await websocket.close(code=1008)
+                return
             await websocket.app.state.proxy.forward_websocket(websocket, route, path)
         return forward
 
