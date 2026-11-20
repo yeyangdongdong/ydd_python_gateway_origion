@@ -6,6 +6,7 @@ import uvicorn
 
 from gateway.app import create_app
 from gateway.config import Settings
+from gateway.logging_setup import LogSettings, setup_logging
 
 
 def main() -> None:
@@ -15,14 +16,20 @@ def main() -> None:
     args = parser.parse_args()
     try:
         settings = Settings.from_env()
+        log_settings = LogSettings.from_env()
         # 路由表也在这里读取：配置写错时立即退出，而不是启动到一半才失败。
-        app = create_app(settings)
+        app = create_app(settings, log_settings)
     except ValueError as error:
         parser.error(str(error))
     if args.host not in {"127.0.0.1", "localhost", "::1"} and not settings.gateway_token:
         parser.error("对外监听前请在 .env 中设置 GATEWAY_TOKEN。")
-    uvicorn.run(app, host=args.host, port=args.port, workers=1,
-                ws_max_size=65536, timeout_graceful_shutdown=10)
+    runtime = setup_logging(log_settings)
+    try:
+        # log_config=None：日志格式与去向完全由我们接管（含 access 日志的脱敏）。
+        uvicorn.run(app, host=args.host, port=args.port, workers=1,
+                    ws_max_size=65536, timeout_graceful_shutdown=10, log_config=None)
+    finally:
+        runtime.stop()
 
 
 if __name__ == "__main__":

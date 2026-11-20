@@ -306,6 +306,16 @@ Agent、会话、消息和运行记录均保存在 SQLite。成功后，助手�
 | `MODEL_USE_SYSTEM_PROXY` | `false` | 是否让模型请求走系统代理。访问本机或内网模型服务时必须保持 `false`；只有需要经代理访问远程服务时才设为 `true` |
 | `GATEWAY_ROUTES_PATH` | `routes.json` | 反向代理路由表位置，相对路径以项目根目录为基准；文件不存在表示不启用 |
 | `GATEWAY_PROXY_TIMEOUT` | `30` | 反向代理访问上游的超时秒数（独立于模型超时） |
+| `GATEWAY_LOG_ENABLED` | `true` | 是否启用结构化日志 |
+| `GATEWAY_LOG_DIR` | `D:\Document\logs\ydd-gateway` | 日志根目录；按类别与被代理服务分子目录 |
+| `GATEWAY_LOG_LEVEL` | `INFO` | 日志级别 |
+| `GATEWAY_LOG_STDOUT` | `false` | 是否同时输出到标准输出（容器采集时打开） |
+| `GATEWAY_LOG_PARAMS` | `true` | 是否记录请求参数（query / JSON body） |
+| `GATEWAY_LOG_CONTENT_PREVIEW` | `200` | 字符串参数保留的字符数；`0` 表示只记长度 |
+| `GATEWAY_LOG_PARAM_MAX_BYTES` | `65536` | 单个请求体最多读取多少字节用于日志 |
+| `GATEWAY_LOG_MAX_BYTES` | `52428800` | 单个日志文件大小上限，超出后追加序号 |
+| `GATEWAY_LOG_BACKUP_DAYS` | `30` | 普通日志保留天数 |
+| `GATEWAY_AUDIT_BACKUP_DAYS` | `180` | 审计日志保留天数 |
 
 `run.py` 默认只监听 `127.0.0.1:8000`。需要局域网访问时，先设置非空 `GATEWAY_TOKEN`，再运行 `python run.py --host 0.0.0.0`；跨不可信网络应通过 HTTPS/WSS 反向代理或受保护的隧道访问。不要把 `.env` 或数据库提交到代码仓库。
 
@@ -321,6 +331,8 @@ ydd_python_gateway_origion/
 │   ├── provider.py             # 演示模型、兼容模型和 SSE 解析
 │   ├── proxy.py                # 可选的反向代理（路由、选路、HTTP 与 WebSocket 转发）
 │   ├── proxy_health.py         # 反向代理的主动探活
+│   ├── access_log.py           # 访问日志中间件与参数脱敏
+│   ├── logging_setup.py        # JSON 格式化、按类别/服务分文件、异步写盘
 │   ├── storage.py              # SQLite 表、迁移和读写操作
 │   ├── tickets.py              # 浏览器连接 WebSocket 用的一次性票据
 │   ├── config.py               # 配置加载和检查
@@ -432,7 +444,43 @@ new WebSocket(`ws://${location.host}/finance/live?ticket=${ticket}`);
 
 `routes.json` 已被 `.gitignore` 忽略（每台机器的端口不同），模板 `routes.json.example` 会提交。Windows 上用记事本或 PowerShell 保存带 BOM 的文件也能正常读取。
 
-## 11. 基础版范围
+## 11. 日志
+
+网关把日志写成 JSON Lines，按类别落到 `GATEWAY_LOG_DIR` 下：
+
+```text
+D:\Document\logs\ydd-gateway\
+├── access\2026-11-21.log      # 每个请求一行：路径、参数、状态、耗时、trace_id
+├── app\2026-11-21.log         # 启动、迁移、未预期异常
+├── proxy\2026-11-21.log       # 选路、冷却、探活
+├── auth\2026-11-21.log        # 登录与会话（阶段 3 起）
+├── audit\2026-11-21.log       # 审计留痕（阶段 2 起）
+└── services\finance\2026-11-21.log   # 被代理服务各自的访问日志
+```
+
+一条访问日志（已脱敏）：
+
+```json
+{"ts":"2026-11-21T00:16:14.500+08:00","level":"INFO","logger":"gateway.access",
+ "message":"http request","event":"http.request","trace_id":"b4c8c291fab14ad5",
+ "service":"gateway",
+ "http":{"method":"POST","path":"/sessions/2b1c/chat","route":"/sessions/{session_id}/chat",
+         "status":200,"duration_ms":28.2,"client_ip":"192.168.1.20","bytes_in":80},
+ "params":{"query":{},"body":{"content":{"preview":"这是一段超过预览长度的消","length":22,"truncated":true}}}}
+```
+
+规则：
+
+- **敏感字段一律打码**：`password`、`token`、`secret`、`api_key`、`authorization`、`cookie`、`ticket` 记为 `***`；
+- **正文只留预览**：超过 `GATEWAY_LOG_CONTENT_PREVIEW` 个字符替换为 `{preview, length, truncated}`；设为 `0` 则只记长度；
+- **超过 `GATEWAY_LOG_PARAM_MAX_BYTES` 的请求体**只记长度，不读入日志；上传类请求只记字段名与大小；
+- **响应头带 `X-Request-ID`**（客户端传入则原样回显），同一请求的 access/app/audit 日志可用它串联；
+- uvicorn 自带的访问日志已关闭（它无法脱敏，会把 `?ticket=` 写进日志）；
+- 写盘走队列线程，不阻塞事件循环；文件按天切分、超过大小追加序号、按保留天数清理。
+
+采集：日志是标准 JSON Lines，可直接用 Vector / Filebeat / Fluent Bit 送到 Loki / ELK；容器里设置 `GATEWAY_LOG_STDOUT=true` 即可只走 stdout。
+
+## 12. 基础版范围
 
 这是独立的简化 Gateway，借鉴 OpenClaw 的职责划分，使用自己的 API。它不能直接替换 OpenClaw Gateway，也不兼容现有 OpenClaw Control UI、CLI、配对和 RPC 协议。
 

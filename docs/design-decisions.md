@@ -301,14 +301,41 @@
 
 ---
 
+## ADR-014 日志：JSON Lines + 队列写盘 + 产出端脱敏
+
+**背景**：原代码只有零散 `logging` 调用，`run.py` 从未配置 → INFO 全部丢失；
+uvicorn 访问日志无法脱敏，会把 `?ticket=` 原样写进日志；排查问题缺少 trace id 与请求参数。
+
+**选项**
+
+| 方案 | 问题 |
+| --- | --- |
+| stdlib logging + 自写 JSON Formatter（选中） | 需要自己写 formatter/context/轮转，但零新依赖、与 uvicorn 兼容 |
+| structlog | 结构化上下文更顺手，但多一层抽象且要和 stdlib 桥接 |
+| loguru | 开箱即用，但与 stdlib/uvicorn 生态割裂 |
+
+**决定**：stdlib + `JsonFormatter` + `QueueHandler/QueueListener`；按 logger 名路由到
+`access/app/proxy/auth/audit/services/<name>` 目录；访问日志用纯 ASGI 中间件旁路采集；
+脱敏在写入前完成；uvicorn 自带 access 日志关闭。
+
+**后果**
+
+- 日志是标准 JSON Lines，可直接被 Vector/Filebeat 采集，不绑定具体"日志框架服务"。
+- 请求体只旁路复制前 `PARAM_MAX_BYTES` 字节，且不重建 Request，所以不影响业务解析。
+- 正文默认只留 200 字预览（可配置为 0），在"可排查"与"不泄露对话"之间取平衡。
+- **trace_id 必须在产出线程抓取**：格式化在队列线程执行，contextvars 不会跟过去，因此用 `TraceIdFilter` 把它写进记录。
+- 队列意味着进程崩溃时可能丢最后几条日志；审计留痕需要额外的强保证（见阶段 2）。
+- 日志字段从此是事实上的对外契约，字段变更要同步 README 与 architecture。
+
+---
+
 ## 待定决策（已知但尚未做）
 
 | 主题 | 现状 | 若要做，建议 |
 | --- | --- | --- |
 | 历史摘要压缩 | 只丢不压 | 在裁剪点调模型生成摘要，存进 sessions 表，作为一条 system 消息 |
 | OpenAI 入站兼容 | 无 | 新增 `POST /v1/chat/completions`，用 `model` 映射到 Agent，复用 `ChatService` |
-| 多用户 | 单 token | 引入 token 表 + 每 token 可见的 Agent/Session；票据也需绑定用户 |
+| 多用户 | 单 token | 引入 token 表 + 每 token 可见的 Agent/Session；票据也需绑定用户（见 docs/proposals） |
 | 迁移回滚 | 只进不退 | 每个版本配一条 down 脚本，或发布前备份数据库 |
-| 结构化日志 | 纯文本 | JSON 日志 + 请求 id 贯穿 HTTP/WS/模型调用 |
 | 代理粘性 | 无 | 按 cookie/IP 做一致性哈希；上游有本地状态时才需要（见 docs/proposals） |
 | 浏览器 Cookie 登录 | 每页自己取票 | 登录页 + 签名 Cookie + CSRF 校验（见 docs/proposals） |

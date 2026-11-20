@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import secrets
+import time
 from contextlib import aclosing, asynccontextmanager, suppress
 from pathlib import Path
 from typing import Annotated
@@ -16,8 +17,10 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, Validation
 from starlette.concurrency import run_in_threadpool
 from starlette.websockets import WebSocketDisconnect
 
+from .access_log import AccessLogMiddleware, log_websocket
 from .config import Settings
 from .errors import GatewayError
+from .logging_setup import LogSettings
 from .provider import ModelProvider
 from .proxy import Proxy, load_routes, match_route
 from .service import ChatService
@@ -70,7 +73,8 @@ class ProxyTicketInput(InputModel):
     path: Text = Field(max_length=2000)
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(settings: Settings | None = None,
+               log_settings: LogSettings | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
     store = Store(settings.db_path)
     tickets = TicketStore()
@@ -94,6 +98,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(title="ydd_python_gateway_origion", version="0.1.0",
                   description="易于理解的 Python Agent Gateway 基础版。", lifespan=lifespan)
+
+    if log_settings is not None and log_settings.enabled:
+        app.state.log_settings = log_settings
+        app.add_middleware(AccessLogMiddleware, settings=log_settings)
 
     def authorized(authorization: str | None) -> bool:
         if not settings.gateway_token:
@@ -261,12 +269,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.websocket("/sessions/{session_id}/stream")
     async def stream(websocket: WebSocket, session_id: str):
+        trace_id = uuid4().hex[:16]
+        started = time.perf_counter()
+        close_code = None
         if not authorized(websocket.headers.get("authorization")):
             # 浏览器原生 WebSocket 设不了请求头，所以改用一次性票据准入。
             if not accepts_ticket(session_id, websocket.query_params.get("ticket")):
                 await websocket.close(code=1008)
                 return
         await websocket.accept()
+        log_websocket("ws.connect", session_id=session_id, trace_id=trace_id,
+                      path=websocket.url.path)
         try:
             await run_in_threadpool(store.get_session, session_id)
         except GatewayError as error:
@@ -314,14 +327,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     break
                 raw = frame.get("text")
                 if raw is None:
+                    close_code = 1003
                     await websocket.close(code=1003, reason="Only JSON text is supported")
                     break
                 if len(raw) > 65536:
+                    close_code = 1009
                     await websocket.close(code=1009)
                     break
                 try:
                     queue.put_nowait(raw)
                 except asyncio.QueueFull:
+                    close_code = 1008
                     await websocket.close(code=1008, reason="Too many pending messages")
                     break
         finally:
@@ -330,6 +346,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             with anyio.CancelScope(shield=True):
                 with suppress(asyncio.CancelledError, WebSocketDisconnect):
                     await worker
+            log_websocket("ws.close", session_id=session_id, trace_id=trace_id,
+                          duration_ms=round((time.perf_counter() - started) * 1000, 1),
+                          close_code=close_code)
 
     # 可选的反向代理：按 routes.json 为每个前缀注册 HTTP 与 WebSocket 转发路由。
     # 放在最后注册，内置接口优先，不会被前缀遮蔽（加载时也已拒绝冲突前缀）。

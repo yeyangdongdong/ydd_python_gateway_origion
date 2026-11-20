@@ -79,6 +79,8 @@
 | `gateway/provider.py` | demo 回显、兼容 Chat Completions 的流式调用 | `ModelProvider.stream`、`_sse_data` | 不写库、不改历史 |
 | `gateway/proxy.py` | 可选的反向代理：路由表、加权轮询、HTTP 流式转发、WebSocket 双向桥接 | `ProxyRoute`、`Proxy`、`load_routes` | 不解析上游语义、不做负载均衡以外的调度 |
 | `gateway/proxy_health.py` | 反向代理的主动探活：周期探测、健康状态机、状态快照 | `HealthSettings`、`HealthMonitor` | 不碰转发路径，只改上游的 `healthy` 标记 |
+| `gateway/access_log.py` | 访问日志中间件：路径、参数摘要、脱敏、trace_id | `AccessLogMiddleware`、`redact` | 不改请求/响应内容 |
+| `gateway/logging_setup.py` | JSON 格式化、按类别/服务分文件、队列写盘、保留策略 | `LogSettings`、`setup_logging`、`DailyFileHandler` | 不决定"记什么"，只负责怎么记 |
 | `gateway/storage.py` | SQLite 表、迁移、索引、事务、查询 | `Store`、`MIGRATIONS` | 不 import `service`，不知道 HTTP |
 | `gateway/tickets.py` | 一次性票据的签发与核销 | `TicketStore`、`TICKET_SECONDS` | 不持久化、不加锁（单事件循环） |
 | `gateway/config.py` | 读环境变量 / `.env`，启动时校验 | `Settings`、`read_flag` | 不做运行时热更新 |
@@ -511,18 +513,30 @@ httpx 的超时管"一段时间没有数据就断"，`asyncio.timeout` 管"这�
 
 ## 11. 可观测性
 
-当前只有标准日志，刻意保持"不含内容"：
+日志由 `logging_setup.py` 统一接管：每条记录一行 JSON，经队列写到按类别/服务划分的文件，
+访问日志由 `access_log.py` 的纯 ASGI 中间件产生。详细字段与规则见
+[README 的"日志"一节](../README.md#11-日志)，这里记录实现层面的约定：
 
-| 位置 | 级别 | 记录内容 | 刻意不记录 |
+| 位置 | 类别 | 记录内容 | 刻意不记录 |
 | --- | --- | --- | --- |
-| `service.stream` 裁剪 | INFO | 会话 id、被省略条数、估算/预算 token | 不记录消息内容 |
-| `service.stream` 未知异常 | ERROR | 异常类型名 | 不记录异常文本（可能含上游响应或用户内容） |
-| `app.stream` 未知异常 | ERROR | 异常类型名 | 同上 |
-| uvicorn access log | INFO | 方法、路径（含查询串）、状态码 | —— |
+| 访问中间件 | `access` | 方法、路径、路由模板、状态、耗时、trace_id、**脱敏后的参数** | 完整请求体、Cookie、Authorization |
+| `service.stream` 裁剪 | `app` | 会话 id、省略条数、估算/预算 token | 消息内容 |
+| `service.stream` 未知异常 | `app` | 异常类型名 | 异常文本 |
+| `proxy.py` 冷却 | `proxy` | 前缀、上游、原因 | 请求内容 |
+| `proxy_health.py` | `proxy` | 判死/恢复、探活循环异常 | —— |
+| 被代理服务 | `service:<name>` | 该前缀的转发访问日志 | —— |
+| uvicorn | `app` | 启动、关停、未预期错误 | —— |
 
-注意 access log 会记录 WS 的 `?ticket=`，这是票据设计的已知暴露面。
+关键实现：
 
-如需增强：可加 `X-Request-ID` 响应头、结构化 JSON 日志、`/health` 暴露版本与队列深度。这些都不影响现有契约。
+- **纯 ASGI 中间件**：只旁路复制请求体前 `PARAM_MAX_BYTES` 字节，不重新构造 Request，因此不影响下游解析；
+- **trace_id 在产出线程抓取**：`TraceIdFilter` 把 contextvar 写进 `LogRecord`，因为格式化发生在队列监听线程；
+- **队列写盘**：`QueueHandler + QueueListener`，磁盘抖动不阻塞事件循环；
+- **按类别路由**：`LogRouter` 依 logger 名分发，服务类日志按 `gateway.service.<name>` 落到 `services/<name>/`；
+- **文件生命周期**：`DailyFileHandler` 按天切分、超过 `GATEWAY_LOG_MAX_BYTES` 追加序号、按保留天数清理旧文件；
+- **关闭时**：`LoggingRuntime.stop()` 停监听线程并关闭句柄，避免 Windows 上文件被占住。
+
+可继续增强：`/metrics`（Prometheus）、OpenTelemetry trace——属于独立一层，不在当前范围。
 
 ## 12. 性能与容量
 
