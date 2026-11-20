@@ -15,6 +15,7 @@
 | [docs/api.md](docs/api.md) | HTTP 端点、WebSocket 协议、事件字段、错误码全表、契约稳定性 | 写客户端 / 对接联调 |
 | [docs/design-decisions.md](docs/design-decisions.md) | 关键取舍（ADR）与"不做什么" | 准备改架构或质疑某个设计 |
 | [docs/development.md](docs/development.md) | 代码地图、测试组织、扩展步骤、调试手法、提交清单 | 要改代码 |
+| [docs/proposals/](docs/proposals/README.md) | 尚未落地的设计提案（健康检查、Cookie SSO、粘性会话、非 HTTP 协议） | 规划下一步 |
 
 ## 1. 安装并启动
 
@@ -318,7 +319,8 @@ ydd_python_gateway_origion/
 │   ├── service.py              # 排队、历史、裁剪、模型调用、保存和去重
 │   ├── context.py              # token 估算和按预算裁剪历史
 │   ├── provider.py             # 演示模型、兼容模型和 SSE 解析
-│   ├── proxy.py                # 可选的反向代理（HTTP 与 WebSocket 转发）
+│   ├── proxy.py                # 可选的反向代理（路由、选路、HTTP 与 WebSocket 转发）
+│   ├── proxy_health.py         # 反向代理的主动探活
 │   ├── storage.py              # SQLite 表、迁移和读写操作
 │   ├── tickets.py              # 浏览器连接 WebSocket 用的一次性票据
 │   ├── config.py               # 配置加载和检查
@@ -326,6 +328,7 @@ ydd_python_gateway_origion/
 ├── web/
 │   └── chat.html               # 内置浏览器聊天页（无外部依赖）
 ├── docs/                       # 技术文档：架构、接口、决策、开发
+├── docs/proposals/             # 尚未实现的设计提案（健康检查已实现）
 ├── examples/                   # HTTP、WebSocket 与管理接口示例
 ├── tests/                      # 自动化测试
 ├── routes.json.example         # 反向代理路由模板
@@ -349,6 +352,7 @@ ydd_python_gateway_origion/
 
 ```json
 {
+  "health": {"enabled": true, "interval_seconds": 10, "failures_to_down": 3},
   "routes": [
     {"prefix": "/finance/", "target": "http://127.0.0.1:9001"},
     {"prefix": "/report/",
@@ -374,6 +378,23 @@ ydd_python_gateway_origion/
 | `websocket` | `true` | 该前缀是否接受 WebSocket |
 | `cooldown_seconds` | `5` | 上游连接失败后的冷却时间 |
 | `headers` | 空 | 额外注入给上游的请求头（如内部服务密钥） |
+| `health` | 关闭 | 主动探活参数，可在顶层写默认值、在单条路由里覆盖 |
+
+**主动探活**（顶层 `health`，默认关闭）：开启后网关按 `interval_seconds` 请求每个上游的 `health.path`，
+
+- 4xx、405、501 算"活着"（探活路径/方法不对不代表服务坏了），只有 5xx 与连不上才算失败；
+- 连续 `failures_to_down` 次失败标记为不健康并从轮询中跳过，连续 `successes_to_up` 次成功后放回；
+- 全部上游都不健康时仍会兜底尝试，不会让整个前缀直接 502；
+- 省流量可以用 `"method": "HEAD"`，但注意有些简单服务不实现 HEAD（会回 501）。
+
+`GET /proxy-status`（需鉴权）查看每个上游的健康状态与最近错误：
+
+```json
+{"enabled": true, "routes": [{"prefix": "/finance/", "health_enabled": true,
+  "upstreams": [{"url": "http://127.0.0.1:9001", "healthy": false,
+                 "cooling": false, "cooldown_seconds": 0.0,
+                 "consecutive_failures": 3, "last_error": "HTTP 500"}]}]}
+```
 
 重启网关后：
 

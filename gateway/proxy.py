@@ -39,6 +39,7 @@ from websockets.asyncio.client import connect
 from websockets.exceptions import WebSocketException
 
 from .errors import GatewayError
+from .proxy_health import HealthMonitor, HealthSettings
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +65,8 @@ REQUEST_DROP = HOP_BY_HOP | {"host", "content-length", "authorization", LOOP_HEA
 WS_FORWARD_HEADERS = {"cookie", "origin", "user-agent"}
 
 # 内置路由占用的第一段路径，配到这里会导致内置接口被遮蔽，直接拒绝。
-RESERVED = {"sessions", "agents", "runs", "health", "docs", "redoc", "openapi.json"}
+RESERVED = {"sessions", "agents", "runs", "health", "docs", "redoc", "openapi.json",
+            "proxy-status"}
 
 # Starlette 允许应用主动发送的关闭码；上游的其他码（如 1006）必须映射。
 ALLOWED_CLOSE_CODES = {1000, 1001, 1002, 1003, *range(1007, 1015)}
@@ -78,6 +80,11 @@ class Upstream:
     weight: int = 1
     current_weight: int = 0
     cooldown_until: float = 0.0
+    # 主动探活的结果；healthy=False 的上游只在没有别的选择时才会被使用。
+    healthy: bool = True
+    consecutive_failures: int = 0
+    consecutive_successes: int = 0
+    last_error: str = ""
 
 
 @dataclass(frozen=True)
@@ -90,6 +97,7 @@ class ProxyRoute:
     websocket: bool = True           # 该前缀是否接受 WebSocket
     cooldown_seconds: float = 5.0    # 连接失败后的冷却时间
     headers: dict[str, str] | None = None  # 额外注入给上游的请求头
+    health: HealthSettings = HealthSettings()  # 主动探活参数（已合并全局默认）
 
     def rewritten_path(self, remainder: str) -> str:
         """算出发给上游的路径：prefix 的取舍 + add_prefix。"""
@@ -127,7 +135,9 @@ def load_routes(path: Path) -> list[ProxyRoute]:
     if not isinstance(data, dict) or not isinstance(data.get("routes"), list):
         raise ValueError(f"路由配置 {path} 需要形如 {{\"routes\": [ ... ]}} 的结构。")
 
-    routes = [_parse_route(item, path) for item in data["routes"]]
+    # 顶层的 health 是所有路由的默认值；每条路由可以再覆盖自己需要的字段。
+    default_health = HealthSettings.from_dict(data.get("health"), f"{path} 的 health")
+    routes = [_parse_route(item, path, default_health) for item in data["routes"]]
     seen: set[str] = set()
     for route in routes:
         if route.prefix in seen:
@@ -145,7 +155,7 @@ def match_route(routes: list[ProxyRoute], path: str) -> ProxyRoute | None:
     return None
 
 
-def _parse_route(item: object, path: Path) -> ProxyRoute:
+def _parse_route(item: object, path: Path, default_health: HealthSettings) -> ProxyRoute:
     if not isinstance(item, dict):
         raise ValueError(f"路由配置 {path} 里的每一项都必须是对象。")
 
@@ -191,9 +201,18 @@ def _parse_route(item: object, path: Path) -> ProxyRoute:
     ):
         raise ValueError(f"路由配置 {path} 里的 headers 必须是字符串键值对。")
 
+    # 路由级 health 覆盖全局：未写的字段沿用全局值，然后整体重新校验。
+    raw_health = item.get("health")
+    if raw_health is None:
+        health = default_health
+    elif isinstance(raw_health, dict):
+        health = default_health.override(raw_health, f"{path} 里 {prefix} 的 health")
+    else:
+        raise ValueError(f"路由配置 {path} 里的 health 必须是对象。")
+
     return ProxyRoute(prefix=prefix, targets=tuple(targets), strip_prefix=strip_prefix,
                       add_prefix=add_prefix, methods=tuple(normalized), websocket=websocket,
-                      cooldown_seconds=float(cooldown), headers=headers)
+                      cooldown_seconds=float(cooldown), headers=headers, health=health)
 
 
 def _parse_targets(item: dict, path: Path) -> list[Upstream]:
@@ -248,8 +267,18 @@ class Proxy:
         self.timeout = timeout
         # 与模型调用同理：默认不读取系统代理，否则本机上游会被代理拦截。
         self.client = httpx.AsyncClient(timeout=timeout, trust_env=False)
+        self.health = HealthMonitor(routes, self.client)
+
+    @property
+    def health_task(self) -> asyncio.Task | None:
+        return self.health.task
+
+    def start(self) -> None:
+        """有任意一条路由开启探活时，启动后台探活协程。"""
+        self.health.start()
 
     async def close(self) -> None:
+        await self.health.close()
         await self.client.aclose()
 
     # ---------------------------------------------------------------- HTTP
@@ -399,27 +428,42 @@ class Proxy:
             await websocket.send_json(_error_event(status, code, message))
             await websocket.close(code=1011)
 
+    # ------------------------------------------------------------- 状态
+
+    def status(self) -> dict:
+        """给 /proxy-status 用的只读快照（探活状态由 HealthMonitor 提供）。"""
+        return self.health.status()
+
     # ------------------------------------------------------------- 选路
 
     def _attempts(self, route: ProxyRoute) -> list[Upstream]:
-        """返回本次的尝试顺序：首选（平滑加权轮询）+ 其余可用 + 冷却中的兜底。"""
+        """返回本次的尝试顺序：健康且未冷却 → 其余未冷却 → 冷却中兜底。
+
+        每组内部用平滑加权轮询；全部不健康时退化为"仍然从这些上游里试"，
+        因为把整个前缀直接判死比偶尔打到坏上游更糟。
+        """
         now = time.monotonic()
-        available = [upstream for upstream in route.targets if upstream.cooldown_until <= now]
+        pool = [upstream for upstream in route.targets
+                if upstream.healthy and upstream.cooldown_until <= now]
+        fallback = [upstream for upstream in route.targets
+                    if not upstream.healthy and upstream.cooldown_until <= now]
         cooling = sorted((upstream for upstream in route.targets
                           if upstream.cooldown_until > now),
                          key=lambda upstream: upstream.cooldown_until)
-        if not available:
-            # 全在冷却：退化为按恢复时间排序，避免整个前缀一直 502。
+        if not pool:
+            pool, fallback = fallback, []
+        if not pool:
             return cooling
 
-        total = sum(upstream.weight for upstream in available)
+        total = sum(upstream.weight for upstream in pool)
         chosen = None
-        for upstream in available:
+        for upstream in pool:
             upstream.current_weight += upstream.weight
             if chosen is None or upstream.current_weight > chosen.current_weight:
                 chosen = upstream
         chosen.current_weight -= total
-        return [chosen] + [upstream for upstream in available if upstream is not chosen] + cooling
+        return [chosen] + [upstream for upstream in pool if upstream is not chosen] \
+            + fallback + cooling
 
     def _cool(self, route: ProxyRoute, upstream: Upstream, reason: str) -> None:
         upstream.cooldown_until = time.monotonic() + route.cooldown_seconds

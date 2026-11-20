@@ -77,7 +77,8 @@
 | `gateway/service.py` | 唯一的编排入口，HTTP 与 WS 共用 | `ChatService.stream`（异步生成器） | 不解析 SSE、不拼 SQL |
 | `gateway/context.py` | token 估算、按预算组装消息、超限报 413 | `estimate_tokens`、`build_context`、`PreparedContext` | 无 I/O、无状态 |
 | `gateway/provider.py` | demo 回显、兼容 Chat Completions 的流式调用 | `ModelProvider.stream`、`_sse_data` | 不写库、不改历史 |
-| `gateway/proxy.py` | 可选的反向代理：路由表、HTTP 流式转发、WebSocket 双向桥接 | `ProxyRoute`、`Proxy`、`load_routes` | 不解析上游语义、不做负载均衡 |
+| `gateway/proxy.py` | 可选的反向代理：路由表、加权轮询、HTTP 流式转发、WebSocket 双向桥接 | `ProxyRoute`、`Proxy`、`load_routes` | 不解析上游语义、不做负载均衡以外的调度 |
+| `gateway/proxy_health.py` | 反向代理的主动探活：周期探测、健康状态机、状态快照 | `HealthSettings`、`HealthMonitor` | 不碰转发路径，只改上游的 `healthy` 标记 |
 | `gateway/storage.py` | SQLite 表、迁移、索引、事务、查询 | `Store`、`MIGRATIONS` | 不 import `service`，不知道 HTTP |
 | `gateway/tickets.py` | 一次性票据的签发与核销 | `TicketStore`、`TICKET_SECONDS` | 不持久化、不加锁（单事件循环） |
 | `gateway/config.py` | 读环境变量 / `.env`，启动时校验 | `Settings`、`read_flag` | 不做运行时热更新 |
@@ -94,6 +95,7 @@ flowchart TD
     context["context.py<br/>估算与裁剪"]
     provider["provider.py<br/>模型调用"]
     proxy["proxy.py<br/>反向代理"]
+    health["proxy_health.py<br/>主动探活"]
     tickets["tickets.py<br/>一次性票据"]
     storage["storage.py<br/>SQLite"]
     config["config.py<br/>配置"]
@@ -116,6 +118,7 @@ flowchart TD
     provider --> config
     provider --> errors
     proxy --> errors
+    proxy --> health
     storage --> errors
 ```
 
@@ -261,6 +264,8 @@ WebSocket 走同一套前缀，但握手方式不同：
 - **子协议**：客户端请求的 `Sec-WebSocket-Protocol` 会透传给上游，再把上游选中的那个回给客户端（`accept(subprotocol=...)`）；
 - **选路状态在内存里**：每个上游带 `current_weight` 与 `cooldown_until`；单进程单事件循环，不需要锁；
 - **失败切换只发生在连接阶段**：WS 在 `accept` 之前可以换上游，`accept` 之后协议无法重放；HTTP 只在幂等方法（GET/HEAD/OPTIONS）上重放，且响应一旦开始就不再重试；
+- **主动探活是独立模块**：`proxy_health.py` 的后台协程按最小间隔探测，只修改上游的 `healthy` 标记；
+  4xx/405/501 视为存活，5xx 与连接失败才计数；全部不健康时仍兜底尝试，避免健康检查本身变成单点；
 - **网关 token 与票据不外泄**：`Authorization` 不转发，`?ticket=` 也会从上游查询串里剔除；
 - **回环识别**：代理给上游请求加 `X-Gateway-Proxy: 1`，如果进来的请求已经带这个头，直接 `508`；
 - **目标只来自配置**，客户端无法指定 URL，因此不存在 SSRF 面。
@@ -547,6 +552,5 @@ get_session → find_request → messages → start_run → complete_run/fail_ru
 | 列表无缓存语义 | 无 ETag / 条件请求，每次全量返回 | 高频轮询列表 |
 | 无工具调用 | 只能文本问答 | 需要函数调用 |
 | 代理只覆盖 HTTP/WS | gRPC、TCP 等协议不能经网关转发 | 需要代理非 HTTP 服务 |
-| 代理无主动健康检查 | 只能靠连接失败被动冷却，慢上游仍可能被选中 | 上游时好时坏、需要主动摘除 |
 | 代理无粘性 / 服务发现 | 无法保证同一客户端固定到同一上游 | 上游持有本地状态（会话、缓存） |
 | 代理 WS 票据需页面配合 | 被代理页面要自己调 `/proxy-ticket` 取票 | 浏览器直连被代理的实时服务 |

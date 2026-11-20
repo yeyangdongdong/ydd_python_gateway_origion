@@ -14,6 +14,7 @@ from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
+from uuid import uuid4
 
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
@@ -98,6 +99,36 @@ class EchoStub(BaseHTTPRequestHandler):
     do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = _handle
 
 
+class HealthStub(BaseHTTPRequestHandler):
+    """探活测试用的上游：改 HealthStub.status 就能让它健康或故障。"""
+
+    status = 200
+    hits = queue.Queue()
+
+    def log_message(self, format, *args):
+        pass
+
+    def do_HEAD(self):
+        self._handle()
+
+    def do_GET(self):
+        self._handle()
+
+    def _handle(self):
+        if self.path.startswith("/health"):
+            HealthStub.hits.put(self.path)
+            body = b""
+            self.send_response(HealthStub.status)
+        else:
+            body = b'{"ok": true}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD" and body:
+            self.wfile.write(body)
+
+
 class WsEchoUpstream:
     """独立的 WebSocket 回显服务，跑在自己的线程和事件循环里。"""
 
@@ -147,6 +178,9 @@ class GatewayTests(unittest.TestCase):
         cls.echo_server2 = ThreadingHTTPServer(("127.0.0.1", 0), EchoStub)
         cls.echo_thread2 = threading.Thread(target=cls.echo_server2.serve_forever, daemon=True)
         cls.echo_thread2.start()
+        cls.health_server = ThreadingHTTPServer(("127.0.0.1", 0), HealthStub)
+        cls.health_thread = threading.Thread(target=cls.health_server.serve_forever, daemon=True)
+        cls.health_thread.start()
         cls.ws_upstream = WsEchoUpstream()
 
     @classmethod
@@ -161,6 +195,9 @@ class GatewayTests(unittest.TestCase):
         cls.echo_server2.shutdown()
         cls.echo_server2.server_close()
         cls.echo_thread2.join(timeout=5)
+        cls.health_server.shutdown()
+        cls.health_server.server_close()
+        cls.health_thread.join(timeout=5)
         cls.ws_upstream.close()
 
     def setUp(self):
@@ -170,6 +207,8 @@ class GatewayTests(unittest.TestCase):
         ModelStub.slow_started.clear()
         ModelStub.release_slow.clear()
         EchoStub.requests = queue.Queue()
+        HealthStub.status = 200
+        HealthStub.hits = queue.Queue()
         self.addCleanup(ModelStub.release_slow.set)
         self.settings = Settings(
             provider="openai", model="fixture-model", api_key="synthetic-model-key",
@@ -189,9 +228,23 @@ class GatewayTests(unittest.TestCase):
     def echo_target2(self):
         return f"http://127.0.0.1:{self.echo_server2.server_port}"
 
+    @property
+    def health_target(self):
+        return f"http://127.0.0.1:{self.health_server.server_port}"
+
+    def wait_until(self, predicate, timeout=5.0):
+        """轮询等待条件成立；探活是后台任务，不能靠固定 sleep。"""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.05)
+        return False
+
     def routed_client(self, routes, headers=None, **overrides):
         """写一份临时路由表并返回已启用代理的客户端。"""
-        path = Path(self.directory.name) / "routes.json"
+        # 每次用唯一文件名：同一个用例里再创建客户端时，不应该继承上一份路由。
+        path = Path(self.directory.name) / f"routes-{uuid4().hex}.json"
         path.write_text(json.dumps({"routes": routes}, ensure_ascii=False), encoding="utf-8")
         settings = replace(self.settings, routes_path=path, **overrides)
         return TestClient(create_app(settings), headers=self.auth if headers is None else headers)
@@ -943,6 +996,81 @@ class GatewayTests(unittest.TestCase):
                                          json={"path": "nope"}).status_code, 422)
             self.assertEqual(client.post("/proxy-ticket", json={"path": "/echo/x"},
                                          headers={"Authorization": ""}).status_code, 401)
+
+
+    def test_health_check_skips_unhealthy_upstream(self):
+        HealthStub.status = 500
+        routes = [{
+            "prefix": "/h/",
+            "targets": [{"url": self.health_target}, {"url": self.echo_target}],
+            "health": {"enabled": True, "interval_seconds": 0.05, "timeout_seconds": 0.5,
+                       "failures_to_down": 1, "successes_to_up": 1},
+        }]
+        with self.routed_client(routes) as client:
+            upstreams = lambda: client.get("/proxy-status").json()["routes"][0]["upstreams"]
+            self.assertTrue(self.wait_until(lambda: upstreams()[0]["healthy"] is False))
+            seen = {client.get("/h/x").headers["X-Proxy-Upstream"] for _ in range(4)}
+            self.assertEqual(seen, {self.echo_target})   # 不健康的上游被跳过
+
+            # 上游恢复后重新参与选路
+            HealthStub.status = 200
+            self.assertTrue(self.wait_until(lambda: upstreams()[0]["healthy"] is True))
+
+    def test_health_check_treats_4xx_as_alive(self):
+        # 探活路径可能要求鉴权：405/403 说明服务活着，不能判死。
+        HealthStub.status = 403
+        routes = [{"prefix": "/h/", "target": self.health_target,
+                   "health": {"enabled": True, "interval_seconds": 0.05,
+                              "timeout_seconds": 0.5, "failures_to_down": 1}}]
+        with self.routed_client(routes) as client:
+            self.assertTrue(self.wait_until(lambda: not HealthStub.hits.empty()))
+            state = client.get("/proxy-status").json()["routes"][0]["upstreams"][0]
+        self.assertTrue(state["healthy"])
+
+    def test_health_check_is_off_by_default(self):
+        routes = [{"prefix": "/h/", "target": self.health_target}]
+        with self.routed_client(routes) as client:
+            self.assertIsNone(client.app.state.proxy.health_task)
+            self.assertTrue(HealthStub.hits.empty())
+            self.assertFalse(client.get("/proxy-status").json()["routes"][0]["health_enabled"])
+
+    def test_proxy_status_requires_auth_and_reports_state(self):
+        with self.routed_client([{"prefix": "/echo/", "target": self.echo_target}]) as client:
+            body = client.get("/proxy-status").json()
+            self.assertTrue(body["enabled"])
+            self.assertEqual(body["routes"][0]["prefix"], "/echo/")
+            self.assertEqual(body["routes"][0]["upstreams"][0]["url"], self.echo_target)
+            self.assertEqual(client.get("/proxy-status",
+                                        headers={"Authorization": ""}).status_code, 401)
+        with self.client() as client:
+            self.assertEqual(client.get("/proxy-status").json(),
+                             {"enabled": False, "routes": []})
+
+    def test_health_config_is_validated(self):
+        cases = [
+            {"enabled": "yes"},
+            {"interval_seconds": 0},
+            {"timeout_seconds": -1},
+            {"method": "POST"},
+            {"failures_to_down": 0},
+            {"successes_to_up": 0},
+            {"unknown": 1},
+        ]
+        for health in cases:
+            with self.subTest(health=health):
+                path = Path(self.directory.name) / "bad-health.json"
+                path.write_text(json.dumps({"routes": [
+                    {"prefix": "/h/", "target": self.health_target, "health": health}],
+                }, ensure_ascii=False), encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    create_app(replace(self.settings, routes_path=path))
+
+        # 顶层 health 同样要校验
+        path = Path(self.directory.name) / "bad-global-health.json"
+        path.write_text(json.dumps({"health": {"interval_seconds": -1}, "routes": [
+            {"prefix": "/h/", "target": self.health_target}]}), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            create_app(replace(self.settings, routes_path=path))
 
 
 if __name__ == "__main__":

@@ -1,4 +1,13 @@
 {
+  "health": {
+    "enabled": false,
+    "path": "/health",
+    "method": "GET",
+    "interval_seconds": 10,
+    "timeout_seconds": 2,
+    "failures_to_down": 3,
+    "successes_to_up": 2
+  },
   "routes": [
     {
       "prefix": "/finance/",
@@ -17,7 +26,8 @@
     {
       "prefix": "/live/",
       "target": "http://127.0.0.1:9004",
-      "websocket": true
+      "websocket": true,
+      "health": {"path": "/livez", "interval_seconds": 5}
     }
   ]
 }

@@ -83,6 +83,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         provider = ModelProvider(settings)
         app.state.chat = ChatService(store, provider, settings)
         app.state.proxy = Proxy(routes, settings.proxy_timeout) if routes else None
+        if app.state.proxy is not None:
+            app.state.proxy.start()
         try:
             yield
         finally:
@@ -144,6 +146,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # auth_required 供页面提示“是否需要填写 token”，不是一个安全边界。
         return {"status": "ok", "provider": settings.provider,
                 "auth_required": bool(settings.gateway_token)}
+
+    @app.get("/proxy-status", dependencies=auth)
+    async def proxy_status():
+        """反向代理的只读状态：每个上游是否健康、是否在冷却、最近一次错误。"""
+        proxy = app.state.proxy
+        if proxy is None:
+            return {"enabled": False, "routes": []}
+        return {"enabled": True, **proxy.status()}
 
     @app.get("/agents", dependencies=auth)
     async def list_agents(limit: int = Query(default=AGENT_PAGE, ge=1, le=1000),

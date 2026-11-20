@@ -60,6 +60,31 @@
 
 不需要 token，可用于探活。
 
+#### `GET /proxy-status`（需鉴权）
+
+反向代理的只读状态：每个上游是否健康、是否在冷却、最近一次失败原因。
+
+```json
+{
+  "enabled": true,
+  "routes": [{
+    "prefix": "/finance/",
+    "health_enabled": true,
+    "upstreams": [{
+      "url": "http://127.0.0.1:9001",
+      "healthy": false,
+      "cooling": false,
+      "cooldown_seconds": 0.0,
+      "consecutive_failures": 3,
+      "last_error": "HTTP 500"
+    }]
+  }]
+}
+```
+
+未配置 `routes.json` 时返回 `{"enabled": false, "routes": []}`。
+`/proxy-status` 是保留路径，不能用作代理前缀。
+
 ### 2.2 Agent
 
 Agent 是"名称 + 系统提示词 + 模型名"的组合。默认 Agent（`id=default`）在首次启动时创建。
@@ -293,6 +318,7 @@ WS    /finance/live         →  ws://127.0.0.1:9001/live
 | --- | --- |
 | 前缀匹配 | 最长前缀优先；`/a/b/` 不会被 `/a/` 遮蔽 |
 | 选路 | 多个上游按平滑加权轮询；连接失败的上游进入冷却（`cooldown_seconds`，默认 5 秒） |
+| 探活 | 顶层 `health` 或路由级 `health` 开启后，主动探测并摘除不健康上游；状态见 `GET /proxy-status` |
 | 失败切换 | 只有幂等方法（GET/HEAD/OPTIONS）在连接失败时换下一个上游；POST 等不重放；响应开始后不重试 |
 | 鉴权 | 与其他业务接口相同：设置了 `GATEWAY_TOKEN` 就必须带 `Authorization`；代理 WS 还可用 `/proxy-ticket` 换的票据 |
 | 转发内容 | 方法、路径、查询串、请求体、状态码、响应头；上游的 4xx/5xx 原样返回 |
