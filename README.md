@@ -350,26 +350,61 @@ ydd_python_gateway_origion/
 ```json
 {
   "routes": [
-    {"prefix": "/finance/", "target": "http://127.0.0.1:9001", "strip_prefix": true}
+    {"prefix": "/finance/", "target": "http://127.0.0.1:9001"},
+    {"prefix": "/report/",
+     "targets": [{"url": "http://127.0.0.1:9002", "weight": 2},
+                 {"url": "http://127.0.0.1:9003", "weight": 1}],
+     "add_prefix": "/api",
+     "methods": ["GET", "POST"],
+     "cooldown_seconds": 5}
   ]
 }
 ```
 
+字段说明：
+
+| 字段 | 默认 | 含义 |
+| --- | --- | --- |
+| `prefix` | 必填 | 形如 `/name/`，按**最长前缀**匹配（`/a/b/` 不会被 `/a/` 遮蔽） |
+| `target` | — | 单个上游地址；与 `targets` 二选一 |
+| `targets` | — | 多个上游 `[{"url", "weight"}]`，按权重轮询 |
+| `strip_prefix` | `true` | 转发时去掉 prefix（设为 `false` 则保留） |
+| `add_prefix` | 空 | 转发前再加一层前缀，例如上游要求 `/api/...` |
+| `methods` | 全部 | 只对指定方法开放，其余返回 405 |
+| `websocket` | `true` | 该前缀是否接受 WebSocket |
+| `cooldown_seconds` | `5` | 上游连接失败后的冷却时间 |
+| `headers` | 空 | 额外注入给上游的请求头（如内部服务密钥） |
+
 重启网关后：
 
-- `GET /finance/report` 转发到 `http://127.0.0.1:9001/report`（`strip_prefix` 为 `true` 时去掉前缀，设为 `false` 则保留成 `/finance/report`）；
-- 同一前缀下的 **WebSocket** 也会被转发，例如 `ws://127.0.0.1:8000/finance/live`。代理的 WS 用 `Authorization` 头鉴权，所以面向 Python、命令行等能设头的客户端；浏览器原生 WebSocket 设不了头，内置聊天页走的是另一套会话票据，不经过这里；
-- 路径、查询串、请求体、状态码、响应头原样转发；上游的 4xx/5xx 也原样返回，不会被改写成网关自己的错误；
-- 网关自己的 token **不会**转发给上游；需要给上游带凭据时，在路由里加 `"headers": {"X-Api-Key": "..."}`；
+- `GET /finance/report` 转发到 `http://127.0.0.1:9001/report`；
+- 多个上游时按**平滑加权轮询**选路；某个上游连接失败会进入冷却（默认 5 秒），期间跳过它；
+- **只有幂等方法（GET/HEAD/OPTIONS）**在连接失败时会换下一个上游；POST 之类不重放，避免重复副作用；响应一旦开始回写也绝不重试；
+- 响应头 `X-Proxy-Upstream` 标出本次实际使用的上游，便于排查；
+- 同一前缀下的 **WebSocket** 也会被转发。能设握手头的客户端（Python/命令行）直接带 `Authorization`；
+- **浏览器**连代理 WS 时，先取票再连接：
+
+```js
+const token = localStorage.getItem("ydd_gateway_token");
+const res = await fetch("/proxy-ticket", {method: "POST",
+  headers: {"Content-Type": "application/json", Authorization: `Bearer ${token}`},
+  body: JSON.stringify({path: "/finance/live"})});
+const {ticket} = await res.json();
+new WebSocket(`ws://${location.host}/finance/live?ticket=${ticket}`);
+```
+
+票据一次性、30 秒、**只对这条路径有效**，并且不会被转发给上游；
+- 路径、查询串、请求体、状态码、响应头原样转发；上游的 4xx/5xx 也原样返回；
+- 网关自己的 token **不会**转发给上游；
 - 响应是流式转发的，SSE、大文件和慢接口都不会被整体读进内存。
 
 几条边界：
 
 | 行为 | 说明 |
 | --- | --- |
-| 鉴权 | 与其他业务接口一致：设置了 `GATEWAY_TOKEN` 就必须带 `Authorization` |
+| 鉴权 | 与其他业务接口一致：设置了 `GATEWAY_TOKEN` 就必须带 `Authorization`；WS 还可以用 `/proxy-ticket` 换的票据 |
 | 回环保护 | 上游又指回网关自己时返回 `508 proxy_loop`（代理会给请求加 `X-Gateway-Proxy: 1` 用作识别） |
-| 超时 | `GATEWAY_PROXY_TIMEOUT`，默认 30 秒，独立于模型超时 |
+| 超时 | `GATEWAY_PROXY_TIMEOUT`，默认 30 秒，独立于模型超时；读超时不重试也不冷却 |
 | 上游连不上 / 超时 | `502 upstream_unreachable` / `504 upstream_timeout` |
 | 前缀冲突 | 与 `/sessions`、`/agents`、`/runs`、`/health`、`/docs` 冲突的前缀在启动时直接拒绝 |
 | 文件不存在 | 不启用反向代理，对内置接口零影响 |

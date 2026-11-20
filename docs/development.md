@@ -42,17 +42,17 @@ Copy-Item .env.example .env
 | 顺序 | 文件 | 行数 | 读它是为了知道 |
 | --- | --- | --- | --- |
 | 1 | `run.py` | 29 | 入口、监听地址、对外监听保护 |
-| 2 | `gateway/app.py` | 336 | 路由、鉴权、校验、错误如何变成状态码；`chat` / `stream` / 代理路由如何接线 |
+| 2 | `gateway/app.py` | 358 | 路由、鉴权、校验、错误如何变成状态码；`chat` / `stream` / 代理路由如何接线 |
 | 3 | `gateway/service.py` | 100 | 唯一的业务编排：排队 → 取历史 → 裁剪 → 调模型 → 落库 → 去重 |
 | 4 | `gateway/context.py` | 135 | token 估算与预算裁剪（纯函数，最容易改） |
 | 5 | `gateway/provider.py` | 122 | demo 回显与 SSE 解析、上游错误如何归一 |
 | 6 | `gateway/storage.py` | 296 | 迁移、表结构、事务边界、查询 |
-| 7 | `gateway/tickets.py` | 61 | 一次性票据（30 秒、单次、绑定会话） |
-| 8 | `gateway/proxy.py` | 278 | 可选反向代理：路由表校验、HTTP 流式转发、WS 桥接（不读也不影响理解主线） |
+| 7 | `gateway/tickets.py` | 62 | 一次性票据（30 秒、单次、绑定资源） |
+| 8 | `gateway/proxy.py` | 443 | 可选反向代理：路由表校验、加权轮询与冷却、HTTP 流式转发、WS 桥接 |
 | 9 | `gateway/config.py` | 105 | 配置项与启动校验 |
 | 10 | `web/chat.html` | 330 | 浏览器页：取票、连 WS、流式渲染 |
 
-合计约 1,480 行 Python（含注释与文档字符串）+ 330 行页面，不含测试。
+合计约 1,670 行 Python（含注释与文档字符串）+ 330 行页面，不含测试。
 行数会漂移，用它判断"该先读哪个"，不要当作精确指标。
 
 不熟悉的状态机、错误分层、并发模型，先看 [architecture.md](architecture.md)。
@@ -61,7 +61,7 @@ Copy-Item .env.example .env
 
 ### 3.1 结构
 
-只有一个测试文件 `tests/test_gateway.py`（约 840 行，40 个用例），原则是**从真实入口验证**：
+只有一个测试文件 `tests/test_gateway.py`（约 950 行，50 个用例），原则是**从真实入口验证**：
 
 - 用 `fastapi.testclient.TestClient` 走真实的 HTTP 与 WebSocket 路径，不直接调用 `ChatService`；
 - 模型服务用本地 `ThreadingHTTPServer` 替身（`ModelStub`），反向代理则用 `EchoStub`（HTTP）与
@@ -103,6 +103,9 @@ Copy-Item .env.example .env
 | 错误形状统一 | `test_websocket_error_events_share_one_shape`、`test_websocket_gateway_error_has_status_and_ids`、`test_http_stream_error_uses_error_envelope` |
 | 数据库迁移与旧库升级 | `test_schema_version_upgrades_legacy_database` |
 | 反向代理（转发、剥前缀、鉴权、502/504、回环、BOM、配置校验） | `test_proxy_forwards_http_and_strips_prefix`、`test_proxy_can_keep_prefix`、`test_proxy_requires_gateway_token`、`test_proxy_stays_disabled_without_routes_file`、`test_proxy_websocket_passthrough`、`test_proxy_upstream_failures`、`test_proxy_timeout_maps_to_504`、`test_proxy_loop_guard`、`test_proxy_route_file_tolerates_bom`、`test_proxy_route_config_is_validated` |
+| 代理选路与失败语义 | `test_proxy_round_robin_uses_all_upstreams`、`test_proxy_weighted_round_robin`、`test_proxy_failover_and_cooldown`、`test_proxy_post_is_not_replayed_on_connect_error` |
+| 代理规则 | `test_proxy_longest_prefix_wins`、`test_proxy_methods_can_be_limited`、`test_proxy_can_add_path_prefix`、`test_proxy_websocket_can_be_disabled` |
+| 代理 WS 票据（浏览器准入） | `test_proxy_ticket_grants_browser_websocket`、`test_proxy_ticket_rejects_unknown_path` |
 | demo 模式零依赖 | `test_default_demo_requires_no_model_service` |
 
 ### 3.4 写新用例时的三个坑
@@ -209,10 +212,15 @@ MIGRATIONS: list[tuple[int, tuple[str, ...]]] = [
 2. 复制 `routes.json.example` 为 `routes.json`，加一条 `{"prefix": "/finance/", "target": "http://127.0.0.1:9001"}`；
 3. 重启网关，访问 `http://127.0.0.1:8000/finance/`。
 
-需要给上游带凭据时加 `"headers": {"X-Api-Key": "..."}`；希望保留前缀就把 `strip_prefix` 设为 `false`。
+需要给上游带凭据时加 `"headers": {"X-Api-Key": "..."}`；希望保留前缀就把 `strip_prefix` 设为 `false`；
+上游要求 `/api/...` 就加 `"add_prefix": "/api"`；只开放部分方法用 `"methods": ["GET"]`。
+多个实例就写 `"targets": [{"url": "...", "weight": 1}, ...]`，按权重轮询并自动冷却故障上游。
 前缀不能与内置接口冲突（`/sessions/` 等），配置写错时启动会直接报错。`routes.json` 已被忽略，不会进仓库。
 
-若想改代理行为（例如支持路径重写、多上游），改 `proxy.py`，并同步 `test_proxy_*` 与
+浏览器要连被代理的 WebSocket 时，页面先 `POST /proxy-ticket` 换票（票据绑定那条精确路径），
+再以 `?ticket=` 连接；票据不会转发给上游。
+
+若想改代理的选路或失败语义，改 `proxy.py` 的 `_attempts` / `_cool`，并同步 `test_proxy_*` 与
 [api.md §2.8](api.md#28-反向代理前缀按-routesjson-动态注册)。
 
 ## 5. 调试手法
@@ -236,7 +244,7 @@ MIGRATIONS: list[tuple[int, tuple[str, ...]]] = [
 
 ## 6. 提交前检查清单
 
-- [ ] `python -m unittest discover -s tests` 全绿（当前 40 个）
+- [ ] `python -m unittest discover -s tests` 全绿（当前 50 个）
 - [ ] `python -m compileall -q gateway tests examples run.py` 通过
 - [ ] 改了接口/事件/错误码 → 同步 `docs/api.md`
 - [ ] 改了行为或配置 → 同步 `README.md` 与 `.env.example`

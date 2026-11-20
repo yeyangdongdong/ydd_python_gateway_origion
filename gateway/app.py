@@ -19,7 +19,7 @@ from starlette.websockets import WebSocketDisconnect
 from .config import Settings
 from .errors import GatewayError
 from .provider import ModelProvider
-from .proxy import PROXY_METHODS, Proxy, load_routes
+from .proxy import Proxy, load_routes, match_route
 from .service import ChatService
 from .storage import Store
 from .tickets import TicketStore
@@ -65,6 +65,11 @@ class ChatInput(InputModel):
     request_id: Text = Field(default_factory=lambda: uuid4().hex, max_length=100)
 
 
+class ProxyTicketInput(InputModel):
+    # 要连接的代理 WS 路径，必须落在已配置的前缀下。
+    path: Text = Field(max_length=2000)
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
     store = Store(settings.db_path)
@@ -95,8 +100,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return secrets.compare_digest((authorization or "").encode("utf-8"), expected)
 
     def accepts_ticket(session_id: str, ticket: str | None) -> bool:
-        # 票据一次性使用，且只对签发时绑定的会话有效。
-        return ticket is not None and tickets.take(ticket) == session_id
+        # 票据一次性使用，且只对签发时绑定的资源有效。
+        return ticket is not None and tickets.take(ticket) == f"session:{session_id}"
 
     def ws_error(session_id: str, error: GatewayError, *, status: int | None = None,
                  **identifiers: str | None) -> dict:
@@ -214,8 +219,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         拿到票据后，页面就能连 `.../stream?ticket=...`。
         """
         await run_in_threadpool(store.get_session, session_id)
-        value, seconds = tickets.issue(session_id)
+        value, seconds = tickets.issue(f"session:{session_id}")
         return {"ticket": value, "session_id": session_id, "expires_in": seconds}
+
+    @app.post("/proxy-ticket", dependencies=auth)
+    async def create_proxy_ticket(data: ProxyTicketInput):
+        """给浏览器换一张连接"被代理的 WebSocket"的一次性票据。
+
+        浏览器设不了握手头，所以先用普通 HTTP 取票，再带 ?ticket= 连接；
+        票据只对这条路径有效，且只能用一次。
+        """
+        if not data.path.startswith("/"):
+            raise GatewayError(422, "invalid_request", "path 必须以 / 开头。")
+        if match_route(routes, data.path) is None:
+            raise GatewayError(404, "route_not_found", "该路径没有配置反向代理。")
+        value, seconds = tickets.issue(f"ws:{data.path}")
+        return {"ticket": value, "path": data.path, "expires_in": seconds}
 
     @app.post("/sessions/{session_id}/chat", dependencies=auth)
     async def chat(session_id: str, data: ChatInput):
@@ -311,10 +330,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     def make_ws_forwarder(route):
         async def forward(websocket: WebSocket, path: str) -> None:
-            # 代理的 WS 走握手头鉴权：浏览器设不了请求头，内置聊天页另有票据机制。
+            # 优先用握手头；浏览器带不了头，就用 /proxy-ticket 换来的票据（绑定到这条路径）。
             if not authorized(websocket.headers.get("authorization")):
-                await websocket.close(code=1008)
-                return
+                ticket = websocket.query_params.get("ticket")
+                if not (ticket and tickets.take(ticket) == f"ws:{websocket.url.path}"):
+                    await websocket.close(code=1008)
+                    return
             await websocket.app.state.proxy.forward_websocket(websocket, route, path)
         return forward
 
@@ -323,14 +344,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         handler.__name__ = f"proxy_{index}"
         # 每个方法单独注册：FastAPI 对多方法路由只生成一个 operationId，
         # 拆开之后 /docs 与代码生成工具里的每个入口都是唯一的。
-        for method in PROXY_METHODS:
+        for method in route.methods:
             app.api_route(route.prefix + "{path:path}", methods=[method],
                           name=f"proxy_{index}_{method.lower()}",
                           dependencies=auth)(handler)
 
-        ws_handler = make_ws_forwarder(route)
-        ws_handler.__name__ = f"proxy_ws_{index}"
-        app.add_api_websocket_route(route.prefix + "{path:path}", ws_handler,
-                                    name=f"proxy_ws_{index}")
+        if route.websocket:
+            ws_handler = make_ws_forwarder(route)
+            ws_handler.__name__ = f"proxy_ws_{index}"
+            app.add_api_websocket_route(route.prefix + "{path:path}", ws_handler,
+                                        name=f"proxy_ws_{index}")
 
     return app

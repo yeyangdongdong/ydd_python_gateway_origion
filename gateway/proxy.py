@@ -5,7 +5,10 @@
 
     {
       "routes": [
-        {"prefix": "/finance/", "target": "http://127.0.0.1:9001"}
+        {"prefix": "/finance/", "target": "http://127.0.0.1:9001"},
+        {"prefix": "/report/",
+         "targets": [{"url": "http://127.0.0.1:9002", "weight": 2},
+                     {"url": "http://127.0.0.1:9003", "weight": 1}]}
       ]
     }
 
@@ -14,16 +17,18 @@
 - 同时转发 HTTP 与 WebSocket；其余协议（如 gRPC）不处理；
 - 目标地址只来自配置，不接受客户端指定，因此天然不会变成 SSRF 跳板；
 - 网关自己的 token 不会转发给上游；需要时用路由里的 headers 注入上游凭据；
-- 浏览器原生 WebSocket 无法携带请求头，所以代理的 WS 需要 `Authorization` 头，
-  不适合直接从浏览器页面连接（内置聊天页走的是会话票据，不经过这里）。
+- 多上游用平滑加权轮询；连接失败的上游会短暂冷却，HTTP 只在幂等方法上切换；
+- 浏览器原生 WebSocket 设不了请求头，所以代理 WS 用 `?ticket=`（由 /proxy-ticket 签发）。
 """
 
 import asyncio
 import json
+import logging
+import time
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit
 
 import httpx
 from starlette.background import BackgroundTask
@@ -35,7 +40,12 @@ from websockets.exceptions import WebSocketException
 
 from .errors import GatewayError
 
-PROXY_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
+logger = logging.getLogger(__name__)
+
+DEFAULT_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
+
+# 只有这些方法的连接失败可以安全地换一个上游：请求还没被处理，重放没有副作用。
+IDEMPOTENT_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 # 逐跳头只对单段连接有意义，不能跨代理转发。
 HOP_BY_HOP = frozenset({
@@ -60,29 +70,52 @@ RESERVED = {"sessions", "agents", "runs", "health", "docs", "redoc", "openapi.js
 ALLOWED_CLOSE_CODES = {1000, 1001, 1002, 1003, *range(1007, 1015)}
 
 
+@dataclass
+class Upstream:
+    """一个上游地址及其选路状态（单进程内使用，不需要加锁）。"""
+
+    url: str
+    weight: int = 1
+    current_weight: int = 0
+    cooldown_until: float = 0.0
+
+
 @dataclass(frozen=True)
 class ProxyRoute:
     prefix: str                      # 必须以 / 开头和结尾，例如 "/finance/"
-    target: str                      # 上游前缀，例如 "http://127.0.0.1:9001"
+    targets: tuple[Upstream, ...]    # 至少一个；多于一个时按权重轮询
     strip_prefix: bool = True        # 转发时是否去掉 prefix
+    add_prefix: str = ""             # 转发前额外加的前缀，例如 "/api"
+    methods: tuple[str, ...] = DEFAULT_METHODS
+    websocket: bool = True           # 该前缀是否接受 WebSocket
+    cooldown_seconds: float = 5.0    # 连接失败后的冷却时间
     headers: dict[str, str] | None = None  # 额外注入给上游的请求头
 
-    def upstream_url(self, remainder: str, query: str) -> str:
-        """把"去掉 prefix 之后的部分"拼回上游地址。"""
+    def rewritten_path(self, remainder: str) -> str:
+        """算出发给上游的路径：prefix 的取舍 + add_prefix。"""
         path = remainder if self.strip_prefix else self.prefix.lstrip("/") + remainder
-        url = f"{self.target}/{path.lstrip('/')}"
+        path = path.lstrip("/")
+        if self.add_prefix:
+            return f"{self.add_prefix}/{path}" if path else self.add_prefix
+        return f"/{path}" if path else "/"
+
+    def upstream_url(self, upstream: Upstream, remainder: str, query: str) -> str:
+        url = upstream.url + self.rewritten_path(remainder)
         return f"{url}?{query}" if query else url
 
-    def upstream_ws_url(self, remainder: str, query: str) -> str:
+    def upstream_ws_url(self, upstream: Upstream, remainder: str, query: str) -> str:
         """HTTP 地址换成 WebSocket 地址：http→ws，https→wss。"""
-        url = self.upstream_url(remainder, query)
-        if url.startswith("https://"):
-            return "wss://" + url[len("https://"):]
-        return "ws://" + url[len("http://"):]
+        url = self.upstream_url(upstream, remainder, query)
+        scheme = "wss://" if url.startswith("https://") else "ws://"
+        return scheme + url.split("://", 1)[1]
 
 
 def load_routes(path: Path) -> list[ProxyRoute]:
-    """读取并校验路由表；文件不存在表示不启用反向代理。"""
+    """读取并校验路由表；文件不存在表示不启用反向代理。
+
+    返回的列表按前缀长度从长到短排序，注册路由时"最长前缀优先"，
+    这样 `/a/b/` 不会被先声明的 `/a/` 遮蔽。
+    """
     if not path.exists():
         return []
     try:
@@ -100,7 +133,16 @@ def load_routes(path: Path) -> list[ProxyRoute]:
         if route.prefix in seen:
             raise ValueError(f"路由配置 {path} 里 prefix 重复：{route.prefix}")
         seen.add(route.prefix)
+    routes.sort(key=lambda route: len(route.prefix), reverse=True)
     return routes
+
+
+def match_route(routes: list[ProxyRoute], path: str) -> ProxyRoute | None:
+    """按最长前缀匹配；列表已排序，所以第一个命中的就是最长的。"""
+    for route in routes:
+        if path.startswith(route.prefix):
+            return route
+    return None
 
 
 def _parse_route(item: object, path: Path) -> ProxyRoute:
@@ -114,18 +156,33 @@ def _parse_route(item: object, path: Path) -> ProxyRoute:
     if prefix.strip("/").split("/")[0] in RESERVED:
         raise ValueError(f"prefix {prefix} 与内置接口冲突，请换一个前缀。")
 
-    target = item.get("target")
-    if not isinstance(target, str):
-        raise ValueError(f"路由配置 {path} 里的 target 必须是字符串。")
-    url = urlsplit(target)
-    if url.scheme not in {"http", "https"} or not url.hostname:
-        raise ValueError(f"target {target} 必须是完整的 http 或 https 地址。")
-    if url.username or url.password or url.query or url.fragment:
-        raise ValueError(f"target {target} 不应包含账号、密码、查询参数或片段。")
-
+    targets = _parse_targets(item, path)
     strip_prefix = item.get("strip_prefix", True)
     if not isinstance(strip_prefix, bool):
         raise ValueError(f"路由配置 {path} 里的 strip_prefix 只能是 true 或 false。")
+
+    add_prefix = item.get("add_prefix", "")
+    if not isinstance(add_prefix, str) or (add_prefix and not add_prefix.startswith("/")):
+        raise ValueError(f"路由配置 {path} 里的 add_prefix 必须是空串或以 / 开头的路径。")
+    add_prefix = add_prefix.rstrip("/")
+
+    methods = item.get("methods", list(DEFAULT_METHODS))
+    if not isinstance(methods, list) or not methods:
+        raise ValueError(f"路由配置 {path} 里的 methods 必须是非空数组。")
+    normalized = []
+    for method in methods:
+        if not isinstance(method, str) or method.upper() not in DEFAULT_METHODS:
+            raise ValueError(f"路由配置 {path} 里的 method {method!r} 不是支持的 HTTP 方法。")
+        if method.upper() not in normalized:
+            normalized.append(method.upper())
+
+    websocket = item.get("websocket", True)
+    if not isinstance(websocket, bool):
+        raise ValueError(f"路由配置 {path} 里的 websocket 只能是 true 或 false。")
+
+    cooldown = item.get("cooldown_seconds", 5.0)
+    if not isinstance(cooldown, (int, float)) or isinstance(cooldown, bool) or cooldown <= 0:
+        raise ValueError(f"路由配置 {path} 里的 cooldown_seconds 必须是大于 0 的数字。")
 
     headers = item.get("headers")
     if headers is not None and not (
@@ -134,8 +191,48 @@ def _parse_route(item: object, path: Path) -> ProxyRoute:
     ):
         raise ValueError(f"路由配置 {path} 里的 headers 必须是字符串键值对。")
 
-    return ProxyRoute(prefix=prefix, target=target.rstrip("/"),
-                      strip_prefix=strip_prefix, headers=headers)
+    return ProxyRoute(prefix=prefix, targets=tuple(targets), strip_prefix=strip_prefix,
+                      add_prefix=add_prefix, methods=tuple(normalized), websocket=websocket,
+                      cooldown_seconds=float(cooldown), headers=headers)
+
+
+def _parse_targets(item: dict, path: Path) -> list[Upstream]:
+    """兼容两种写法：单个 target 字符串，或带权重的 targets 数组。"""
+    if "target" in item and "targets" in item:
+        raise ValueError(f"路由配置 {path} 里不能同时写 target 和 targets。")
+    raw = item.get("targets")
+    if raw is None:
+        target = item.get("target")
+        if not isinstance(target, str):
+            raise ValueError(f"路由配置 {path} 里的每条路由都需要 target 或 targets。")
+        raw = [{"url": target}]
+    if not isinstance(raw, list) or not raw:
+        raise ValueError(f"路由配置 {path} 里的 targets 必须是非空数组。")
+
+    targets: list[Upstream] = []
+    seen: set[str] = set()
+    for entry in raw:
+        if isinstance(entry, str):
+            url, weight = entry, 1
+        elif isinstance(entry, dict):
+            url, weight = entry.get("url"), entry.get("weight", 1)
+        else:
+            raise ValueError(f"路由配置 {path} 里的 targets 项必须是字符串或对象。")
+        if not isinstance(url, str):
+            raise ValueError(f"路由配置 {path} 里的 target url 必须是字符串。")
+        parsed = urlsplit(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError(f"target {url} 必须是完整的 http 或 https 地址。")
+        if parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise ValueError(f"target {url} 不应包含账号、密码、查询参数或片段。")
+        if not isinstance(weight, int) or isinstance(weight, bool) or weight <= 0:
+            raise ValueError(f"target {url} 的 weight 必须是正整数。")
+        url = url.rstrip("/")
+        if url in seen:
+            raise ValueError(f"路由配置 {path} 里的 targets 出现了重复地址：{url}")
+        seen.add(url)
+        targets.append(Upstream(url=url, weight=weight))
+    return targets
 
 
 def _error_event(status: int, code: str, message: str) -> dict:
@@ -161,28 +258,48 @@ class Proxy:
         if request.headers.get(LOOP_HEADER):
             raise GatewayError(508, "proxy_loop", "检测到代理回环：上游又指回了网关自己。")
 
-        url = route.upstream_url(remainder, request.url.query)
         headers = self._request_headers(request.headers, route)
         body = await request.body()
-        upstream_request = self.client.build_request(
-            request.method, url, headers=headers, content=body if body else None,
-        )
-        try:
-            upstream = await self.client.send(upstream_request, stream=True)
-        except httpx.TimeoutException as exc:
-            raise GatewayError(504, "upstream_timeout",
-                               f"上游 {route.target} 响应超时，请检查该服务。") from exc
-        except httpx.RequestError as exc:
-            raise GatewayError(502, "upstream_unreachable",
-                               f"无法连接上游 {route.target}，请确认服务是否在运行。") from exc
+        # POST 之类的请求可能已经有副作用，连接失败也不换上游重放。
+        retry_allowed = request.method in IDEMPOTENT_METHODS
+        attempts = self._attempts(route)
+        last_error = "连接失败"
 
-        # 流式转发：不要把上游整个响应读进内存，否则 SSE 和大文件都会出问题。
-        return StreamingResponse(
-            upstream.aiter_raw(),
-            status_code=upstream.status_code,
-            headers=self._response_headers(upstream.headers),
-            background=BackgroundTask(upstream.aclose),
-        )
+        for upstream in attempts:
+            url = route.upstream_url(upstream, remainder, request.url.query)
+            outgoing = self.client.build_request(request.method, url, headers=headers,
+                                                 content=body or None)
+            try:
+                response = await self.client.send(outgoing, stream=True)
+            except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                # 连接阶段就失败，说明请求没有被处理，可以安全地换下一个。
+                last_error = type(exc).__name__
+                self._cool(route, upstream, last_error)
+                if not retry_allowed:
+                    break
+                continue
+            except httpx.TimeoutException as exc:
+                # 已经连上但迟迟没有响应：可能已在别处生效，不重试、也不冷却。
+                raise GatewayError(504, "upstream_timeout",
+                                   f"上游 {upstream.url} 响应超时，请检查该服务。") from exc
+            except httpx.RequestError as exc:
+                last_error = type(exc).__name__
+                self._cool(route, upstream, last_error)
+                if not retry_allowed:
+                    break
+                continue
+
+            # 流式转发：不要把上游整个响应读进内存，否则 SSE 和大文件都会出问题。
+            return StreamingResponse(
+                response.aiter_raw(),
+                status_code=response.status_code,
+                headers={**self._response_headers(response.headers),
+                         "X-Proxy-Upstream": upstream.url},
+                background=BackgroundTask(response.aclose),
+            )
+
+        raise GatewayError(502, "upstream_unreachable",
+                           f"无法连接上游（{len(attempts)} 个候选，最后一次：{last_error}）。")
 
     # ----------------------------------------------------------- WebSocket
 
@@ -194,29 +311,50 @@ class Proxy:
             await websocket.close(code=1008)
             return
 
-        url = route.upstream_ws_url(remainder, websocket.url.query)
         headers = {key: value for key, value in websocket.headers.items()
                    if key.lower() in WS_FORWARD_HEADERS}
         if route.headers:
             headers.update(route.headers)
         subprotocols = list(websocket.scope.get("subprotocols") or [])
 
+        connection = None
+        last_status = 502
+        # 网关票据只用于网关自己的准入，不能转发给上游（那是别人的凭证）。
+        query = urlencode([(key, value) for key, value in
+                           parse_qsl(websocket.url.query, keep_blank_values=True)
+                           if key != "ticket"])
+        for upstream in self._attempts(route):
+            url = route.upstream_ws_url(upstream, remainder, query)
+            try:
+                # 先连上游再 accept：失败还能换下一个，accept 之后就只能将错就错。
+                connection = await connect(url, additional_headers=headers or None,
+                                           subprotocols=subprotocols or None,
+                                           open_timeout=self.timeout, max_size=None)
+                break
+            except (TimeoutError, asyncio.TimeoutError):
+                last_status = 504
+                self._cool(route, upstream, "connect timeout")
+            except (OSError, WebSocketException):
+                last_status = 502
+                self._cool(route, upstream, "connect error")
+
+        if connection is None:
+            await self._close_with_error(
+                websocket, last_status,
+                "upstream_timeout" if last_status == 504 else "upstream_unreachable",
+                f"无法连接上游的 WebSocket（{len(route.targets)} 个候选）。")
+            return
+
+        close_code = None
         try:
-            async with connect(url, additional_headers=headers or None,
-                               subprotocols=subprotocols or None,
-                               open_timeout=self.timeout, max_size=None) as upstream:
-                # 先连上游再 accept：这样可以把上游选中的子协议原样回给客户端。
-                await websocket.accept(subprotocol=upstream.subprotocol)
-                await self._bridge(websocket, upstream)
-                close_code = upstream.close_code
-        except (TimeoutError, asyncio.TimeoutError):
-            await self._close_with_error(websocket, 504, "upstream_timeout",
-                                         f"连接上游 {route.target} 的 WebSocket 超时。")
+            await websocket.accept(subprotocol=connection.subprotocol)
+            await self._bridge(websocket, connection)
+            close_code = connection.close_code
+        except RuntimeError:
+            # 客户端在 accept 之前就断开了。
             return
-        except (OSError, WebSocketException):
-            await self._close_with_error(websocket, 502, "upstream_unreachable",
-                                         f"无法连接上游 {route.target} 的 WebSocket。")
-            return
+        finally:
+            await connection.close()
 
         code = close_code if close_code in ALLOWED_CLOSE_CODES else 1011
         with suppress(RuntimeError, WebSocketDisconnect):
@@ -260,6 +398,33 @@ class Proxy:
         with suppress(RuntimeError, WebSocketDisconnect):
             await websocket.send_json(_error_event(status, code, message))
             await websocket.close(code=1011)
+
+    # ------------------------------------------------------------- 选路
+
+    def _attempts(self, route: ProxyRoute) -> list[Upstream]:
+        """返回本次的尝试顺序：首选（平滑加权轮询）+ 其余可用 + 冷却中的兜底。"""
+        now = time.monotonic()
+        available = [upstream for upstream in route.targets if upstream.cooldown_until <= now]
+        cooling = sorted((upstream for upstream in route.targets
+                          if upstream.cooldown_until > now),
+                         key=lambda upstream: upstream.cooldown_until)
+        if not available:
+            # 全在冷却：退化为按恢复时间排序，避免整个前缀一直 502。
+            return cooling
+
+        total = sum(upstream.weight for upstream in available)
+        chosen = None
+        for upstream in available:
+            upstream.current_weight += upstream.weight
+            if chosen is None or upstream.current_weight > chosen.current_weight:
+                chosen = upstream
+        chosen.current_weight -= total
+        return [chosen] + [upstream for upstream in available if upstream is not chosen] + cooling
+
+    def _cool(self, route: ProxyRoute, upstream: Upstream, reason: str) -> None:
+        upstream.cooldown_until = time.monotonic() + route.cooldown_seconds
+        logger.warning("Proxy %s -> %s cooling %.0fs (%s)",
+                       route.prefix, upstream.url, route.cooldown_seconds, reason)
 
     # ------------------------------------------------------------- helpers
 

@@ -235,18 +235,23 @@ sequenceDiagram
     C->>A: GET /finance/report（Bearer）
     A->>A: require_auth（与其他接口一致）
     A->>P: forward(request, route, "report")
-    P->>P: 去掉逐跳头 / 网关 token / 回环标记
-    P->>U: GET http://127.0.0.1:9001/report + X-Gateway-Proxy: 1
+    P->>P: 选路：平滑加权轮询，跳过冷却中的上游
+    P->>P: 改写路径（strip_prefix / add_prefix）+ 去掉逐跳头
+    P->>U: GET http://127.0.0.1:9001/api/report + X-Gateway-Proxy: 1
+    alt 连接失败且方法是幂等的
+        P->>U: 换下一个上游重试
+    end
     U-->>P: 200 + 响应体（可以是流）
-    P-->>C: StreamingResponse（状态码与头原样）
+    P-->>C: StreamingResponse（X-Proxy-Upstream 标出实际上游）
 ```
 
 WebSocket 走同一套前缀，但握手方式不同：
 
 ```text
-客户端 --WS /finance/live--> 网关（校验 Bearer）--> 上游 ws://127.0.0.1:9001/live
-                                        ├── 客户端帧 → 上游
-                                        └── 上游帧 → 客户端
+浏览器 --POST /proxy-ticket--> 网关（Bearer）--签发 ws:<路径> 票据
+浏览器 --WS /finance/live?ticket=...--> 网关（核销票据，不转发 ticket）--> 上游 ws://127.0.0.1:9001/live
+                                          ├── 客户端帧 → 上游
+                                          └── 上游帧 → 客户端
 ```
 
 关键点：
@@ -254,7 +259,9 @@ WebSocket 走同一套前缀，但握手方式不同：
 - **HTTP 用 `aiter_raw` 流式回写**，上游是 SSE 或大文件时不会被整体读进内存；
 - **WS 用两条协程双向搬运**，任意一侧结束就收尾，并把上游的关闭码映射成 Starlette 允许的码（1006 之类改成 1011）；
 - **子协议**：客户端请求的 `Sec-WebSocket-Protocol` 会透传给上游，再把上游选中的那个回给客户端（`accept(subprotocol=...)`）；
-- **网关 token 不外泄**：`Authorization` 不转发；需要给上游带凭据就在路由里配 `headers`；
+- **选路状态在内存里**：每个上游带 `current_weight` 与 `cooldown_until`；单进程单事件循环，不需要锁；
+- **失败切换只发生在连接阶段**：WS 在 `accept` 之前可以换上游，`accept` 之后协议无法重放；HTTP 只在幂等方法（GET/HEAD/OPTIONS）上重放，且响应一旦开始就不再重试；
+- **网关 token 与票据不外泄**：`Authorization` 不转发，`?ticket=` 也会从上游查询串里剔除；
 - **回环识别**：代理给上游请求加 `X-Gateway-Proxy: 1`，如果进来的请求已经带这个头，直接 `508`；
 - **目标只来自配置**，客户端无法指定 URL，因此不存在 SSRF 面。
 
@@ -540,5 +547,6 @@ get_session → find_request → messages → start_run → complete_run/fail_ru
 | 列表无缓存语义 | 无 ETag / 条件请求，每次全量返回 | 高频轮询列表 |
 | 无工具调用 | 只能文本问答 | 需要函数调用 |
 | 代理只覆盖 HTTP/WS | gRPC、TCP 等协议不能经网关转发 | 需要代理非 HTTP 服务 |
-| 代理无负载均衡 | 一个前缀只能指向一个上游，没有权重与故障转移 | 需要多实例分流 |
-| 代理 WS 需请求头鉴权 | 浏览器原生 WebSocket 无法连代理前缀 | 浏览器访问被代理的实时服务 |
+| 代理无主动健康检查 | 只能靠连接失败被动冷却，慢上游仍可能被选中 | 上游时好时坏、需要主动摘除 |
+| 代理无粘性 / 服务发现 | 无法保证同一客户端固定到同一上游 | 上游持有本地状态（会话、缓存） |
+| 代理 WS 票据需页面配合 | 被代理页面要自己调 `/proxy-ticket` 取票 | 浏览器直连被代理的实时服务 |

@@ -233,9 +233,25 @@ Agent 是"名称 + 系统提示词 + 模型名"的组合。默认 Agent（`id=de
 供浏览器连接 WebSocket 使用（浏览器无法设置请求头）。规则：
 
 - 只能用一次，连接时核销；
-- 只对签发时绑定的会话有效，用错会话同样作废；
+- 只对签发时绑定的**资源**有效：这里是 `session:<会话编号>`；用错资源同样作废；
 - 30 秒有效期（`gateway/tickets.py` 的 `TICKET_SECONDS`）；
 - 只存内存，服务重启即失效。
+
+#### `POST /proxy-ticket` → `200`
+
+给"被反向代理的 WebSocket"签一张票据（代理没配置时返回 `404 route_not_found`）。
+
+```json
+{"path": "/finance/live"}
+```
+
+```json
+{"ticket": "IKl8vC4PTwGtRdHag-...", "path": "/finance/live", "expires_in": 30}
+```
+
+- `path` 必须落在某个已配置的前缀下，否则 `404 route_not_found`；不以 `/` 开头则 `422`；
+- 票据资源是 `ws:<path>`，**只对这条精确路径有效**，一次性，30 秒；
+- 连接时用 `WS /finance/live?ticket=...`；网关会核销票据，但**不会**把 `ticket` 查询参数转发给上游。
 
 ### 2.7 运行记录查询
 
@@ -275,12 +291,18 @@ WS    /finance/live         →  ws://127.0.0.1:9001/live
 
 | 规则 | 说明 |
 | --- | --- |
-| 鉴权 | 与其他业务接口相同：设置了 `GATEWAY_TOKEN` 就必须带 `Authorization`；WS 同样走握手头 |
+| 前缀匹配 | 最长前缀优先；`/a/b/` 不会被 `/a/` 遮蔽 |
+| 选路 | 多个上游按平滑加权轮询；连接失败的上游进入冷却（`cooldown_seconds`，默认 5 秒） |
+| 失败切换 | 只有幂等方法（GET/HEAD/OPTIONS）在连接失败时换下一个上游；POST 等不重放；响应开始后不重试 |
+| 鉴权 | 与其他业务接口相同：设置了 `GATEWAY_TOKEN` 就必须带 `Authorization`；代理 WS 还可用 `/proxy-ticket` 换的票据 |
 | 转发内容 | 方法、路径、查询串、请求体、状态码、响应头；上游的 4xx/5xx 原样返回 |
-| 不转发 | 逐跳头（`connection`、`transfer-encoding` 等）、`host`、`content-length`、网关的 `Authorization` |
+| 路径改写 | `strip_prefix`（默认去前缀）+ `add_prefix`（默认空，可再加一层） |
+| 方法限制 | `methods` 只开放指定方法，其余返回 405 |
+| 不转发 | 逐跳头（`connection`、`transfer-encoding` 等）、`host`、`content-length`、网关的 `Authorization`，以及 WS 的 `ticket` 参数 |
 | 注入 | 网关自动加 `X-Gateway-Proxy: 1`；路由配置里的 `headers` 会合并进上游请求 |
 | 流式 | 响应边收边转发，SSE 与大文件不会被整体缓冲 |
-| 超时 | `GATEWAY_PROXY_TIMEOUT`，默认 30 秒 |
+| 观测 | 响应头 `X-Proxy-Upstream` 标出本次使用的上游 |
+| 超时 | `GATEWAY_PROXY_TIMEOUT`，默认 30 秒；读超时不重试、不冷却 |
 | 错误 | `502 upstream_unreachable`、`504 upstream_timeout`、`508 proxy_loop` |
 
 代理 WS 的错误事件与会话流同形状，只是没有 `session_id`（不是会话级连接）：
@@ -306,6 +328,8 @@ GATEWAY_TOKEN 为空        → 直接放行（不看票据）
 否则看 ?ticket=           → 票据有效且属于该会话才放行，取出即作废
 否则                      → close 1008
 ```
+
+被反向代理的前缀是另一套准入：`Authorization` 头，或 `/proxy-ticket` 为**那条路径**签发的票据（见 [2.8](#28-反向代理前缀按-routesjson-动态注册)）。
 
 ### 3.2 请求帧
 
@@ -361,6 +385,7 @@ GATEWAY_TOKEN 为空        → 直接放行（不看票据）
 | 404 | `session_not_found` | 会话不存在（含已删除） | 重新创建会话 |
 | 404 | `request_not_found` | 该 `request_id` 尚未落地 | 稍后重试查询，或确认是否真的发出 |
 | 404 | `run_not_found` | 运行 ID 不存在 | 检查 ID |
+| 404 | `route_not_found` | 申请代理票据的路径没有配置反向代理 | 检查 `routes.json` 前缀 |
 | 409 | `request_conflict` | 同一 `request_id` 用于不同内容 | 需要新一轮生成就换编号 |
 | 409 | `request_not_completed` | 同一 `request_id` 的上一轮失败/中断 | 查询记录确认后换编号重试 |
 | 409 | `session_busy` | 会话正在生成，却要删除或清空 | 等这一轮结束 |

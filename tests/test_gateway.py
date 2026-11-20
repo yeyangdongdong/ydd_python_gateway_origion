@@ -144,6 +144,9 @@ class GatewayTests(unittest.TestCase):
         cls.echo_server = ThreadingHTTPServer(("127.0.0.1", 0), EchoStub)
         cls.echo_thread = threading.Thread(target=cls.echo_server.serve_forever, daemon=True)
         cls.echo_thread.start()
+        cls.echo_server2 = ThreadingHTTPServer(("127.0.0.1", 0), EchoStub)
+        cls.echo_thread2 = threading.Thread(target=cls.echo_server2.serve_forever, daemon=True)
+        cls.echo_thread2.start()
         cls.ws_upstream = WsEchoUpstream()
 
     @classmethod
@@ -155,6 +158,9 @@ class GatewayTests(unittest.TestCase):
         cls.echo_server.shutdown()
         cls.echo_server.server_close()
         cls.echo_thread.join(timeout=5)
+        cls.echo_server2.shutdown()
+        cls.echo_server2.server_close()
+        cls.echo_thread2.join(timeout=5)
         cls.ws_upstream.close()
 
     def setUp(self):
@@ -178,6 +184,10 @@ class GatewayTests(unittest.TestCase):
     @property
     def echo_target(self):
         return f"http://127.0.0.1:{self.echo_server.server_port}"
+
+    @property
+    def echo_target2(self):
+        return f"http://127.0.0.1:{self.echo_server2.server_port}"
 
     def routed_client(self, routes, headers=None, **overrides):
         """写一份临时路由表并返回已启用代理的客户端。"""
@@ -834,6 +844,105 @@ class GatewayTests(unittest.TestCase):
                 path.write_text(json.dumps({"routes": routes}, ensure_ascii=False), encoding="utf-8")
                 with self.assertRaises(ValueError):
                     create_app(replace(self.settings, routes_path=path))
+
+    def test_proxy_round_robin_uses_all_upstreams(self):
+        routes = [{"prefix": "/echo/", "targets": [
+            {"url": self.echo_target}, {"url": self.echo_target2}]}]
+        with self.routed_client(routes) as client:
+            seen = [client.get("/echo/x").headers["X-Proxy-Upstream"] for _ in range(4)]
+        self.assertEqual(seen, [self.echo_target, self.echo_target2,
+                                self.echo_target, self.echo_target2])
+
+    def test_proxy_weighted_round_robin(self):
+        routes = [{"prefix": "/echo/", "targets": [
+            {"url": self.echo_target, "weight": 2},
+            {"url": self.echo_target2, "weight": 1}]}]
+        with self.routed_client(routes) as client:
+            seen = [client.get("/echo/x").headers["X-Proxy-Upstream"] for _ in range(6)]
+        self.assertEqual(seen.count(self.echo_target), 4)
+        self.assertEqual(seen.count(self.echo_target2), 2)
+
+    def test_proxy_failover_and_cooldown(self):
+        routes = [{"prefix": "/echo/", "targets": [
+            {"url": "http://127.0.0.1:1"}, {"url": self.echo_target}]}]
+        with self.routed_client(routes) as client:
+            first = client.get("/echo/x")
+            self.assertEqual(first.status_code, 200, first.text)
+            self.assertEqual(first.headers["X-Proxy-Upstream"], self.echo_target)
+            dead = client.app.state.proxy.routes[0].targets[0]
+            self.assertGreater(dead.cooldown_until, 0)      # 连接失败的已被冷却
+            second = client.get("/echo/y")
+            self.assertEqual(second.headers["X-Proxy-Upstream"], self.echo_target)
+
+    def test_proxy_post_is_not_replayed_on_connect_error(self):
+        routes = [{"prefix": "/echo/", "targets": [
+            {"url": "http://127.0.0.1:1"}, {"url": self.echo_target}]}]
+        with self.routed_client(routes) as client:
+            statuses = [client.post("/echo/x", json={}).status_code for _ in range(4)]
+        self.assertIn(502, statuses)      # 选中死上游时直接失败，不重放
+        self.assertIn(200, statuses)      # 选中活上游时正常
+
+    def test_proxy_longest_prefix_wins(self):
+        routes = [
+            {"prefix": "/a/", "target": self.echo_target},
+            {"prefix": "/a/b/", "target": self.echo_target2},
+        ]
+        with self.routed_client(routes) as client:
+            response = client.get("/a/b/x")
+        self.assertEqual(response.headers["X-Proxy-Upstream"], self.echo_target2)
+
+    def test_proxy_methods_can_be_limited(self):
+        routes = [{"prefix": "/echo/", "target": self.echo_target, "methods": ["GET"]}]
+        with self.routed_client(routes) as client:
+            self.assertEqual(client.get("/echo/x").status_code, 200)
+            self.assertEqual(client.post("/echo/x").status_code, 405)
+
+    def test_proxy_can_add_path_prefix(self):
+        routes = [{"prefix": "/echo/", "target": self.echo_target, "add_prefix": "/api"}]
+        with self.routed_client(routes) as client:
+            self.assertEqual(client.get("/echo/x").status_code, 200)
+        self.assertEqual(EchoStub.requests.get_nowait()["path"], "/api/x")
+
+    def test_proxy_websocket_can_be_disabled(self):
+        target = f"http://127.0.0.1:{self.ws_upstream.port}"
+        routes = [{"prefix": "/echo/", "target": target, "websocket": False}]
+        with self.routed_client(routes) as client:
+            with self.assertRaises(WebSocketDisconnect):
+                with client.websocket_connect("/echo/ws"):
+                    pass
+
+    def test_proxy_ticket_grants_browser_websocket(self):
+        target = f"http://127.0.0.1:{self.ws_upstream.port}"
+        browser = {"Authorization": ""}
+        with self.routed_client([{"prefix": "/echo/", "target": target}]) as client:
+            ticket = client.post("/proxy-ticket", json={"path": "/echo/ws"}).json()
+            self.assertEqual(ticket["path"], "/echo/ws")
+            with client.websocket_connect(f"/echo/ws?ticket={ticket['ticket']}",
+                                          headers=browser) as websocket:
+                # 上游收到的路径里不能带 ?ticket=：网关票据不能泄露给别的服务。
+                self.assertEqual(websocket.receive_text(), "path:/ws")
+
+            # 一次性：同一张票不能再用。
+            with self.assertRaises(WebSocketDisconnect):
+                with client.websocket_connect(f"/echo/ws?ticket={ticket['ticket']}",
+                                              headers=browser):
+                    pass
+
+            # 绑定路径：给别的路径签的票连不上这条。
+            other = client.post("/proxy-ticket", json={"path": "/echo/other"}).json()
+            with self.assertRaises(WebSocketDisconnect):
+                with client.websocket_connect(f"/echo/ws?ticket={other['ticket']}",
+                                              headers=browser):
+                    pass
+
+    def test_proxy_ticket_rejects_unknown_path(self):
+        with self.routed_client([{"prefix": "/echo/", "target": self.echo_target}]) as client:
+            self.assertEqual(client.post("/proxy-ticket",
+                                         json={"path": "/nope/x"}).status_code, 404)
+            self.assertEqual(client.post("/proxy-ticket",
+                                         json={"path": "nope"}).status_code, 422)
+            self.assertEqual(client.post("/proxy-ticket", json={"path": "/echo/x"},
+                                         headers={"Authorization": ""}).status_code, 401)
 
 
 if __name__ == "__main__":
