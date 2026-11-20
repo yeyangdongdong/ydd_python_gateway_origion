@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Gateway 聊天</title>
+<!-- 内联图标，避免浏览器再去请求 /favicon.ico 并产生一条 404 日志。 -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232563eb'/%3E%3Ctext x='16' y='22' font-size='16' font-family='sans-serif' text-anchor='middle' fill='white'%3EG%3C/text%3E%3C/svg%3E">
+<!--
+  这个页面由 Gateway 自己提供（GET /），只使用浏览器的原生能力：
+  1. 普通 HTTP 请求用 Authorization 头携带 token；
+  2. WebSocket 不能带请求头，所以先换一张一次性票据，再用 ?ticket= 连接。
+  所有模型输出都用 textContent 写入页面，不会被当作 HTML 解析。
+-->
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f5f6f8; --panel: #ffffff; --line: #dde2e8; --text: #1f2328;
+    --muted: #6b7280; --brand: #2563eb; --bad: #b42318;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14171c; --panel: #1b1f26; --line: #2c3239; --text: #e6e8eb;
+      --muted: #9aa4b2; --brand: #4f8cff; --bad: #ff8a80;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; height: 100dvh; display: flex; flex-direction: column;
+    background: var(--bg); color: var(--text);
+    font: 15px/1.6 "Segoe UI", system-ui, -apple-system, "Microsoft YaHei", sans-serif;
+  }
+  header {
+    display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
+    padding: 12px 16px; border-bottom: 1px solid var(--line); background: var(--panel);
+  }
+  header h1 { font-size: 16px; margin: 0; }
+  header .meta { color: var(--muted); font-size: 13px; flex: 1; overflow-wrap: anywhere; }
+  button {
+    font: inherit; padding: 6px 14px; border-radius: 8px; cursor: pointer;
+    border: 1px solid var(--line); background: var(--panel); color: var(--text);
+  }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  button.primary { background: var(--brand); border-color: var(--brand); color: #fff; }
+  .auth { display: flex; gap: 8px; align-items: center; padding: 8px 16px;
+          border-bottom: 1px solid var(--line); background: var(--panel); flex-wrap: wrap; }
+  .auth label { color: var(--muted); font-size: 13px; }
+  .auth input {
+    font: inherit; padding: 5px 10px; width: 220px; border-radius: 8px;
+    border: 1px solid var(--line); background: var(--bg); color: var(--text);
+  }
+  .auth .note { margin: 0; color: var(--muted); font-size: 12px; }
+  main { flex: 1; overflow-y: auto; padding: 18px 16px; display: flex; flex-direction: column; gap: 10px; }
+  .bubble {
+    max-width: min(680px, 86%); padding: 9px 13px; border-radius: 12px;
+    white-space: pre-wrap; overflow-wrap: anywhere;
+  }
+  .bubble.user { align-self: flex-end; background: var(--brand); color: #fff; }
+  .bubble.assistant { align-self: flex-start; background: var(--panel); border: 1px solid var(--line); }
+  .bubble.error { border-color: var(--bad); color: var(--bad); }
+  .bubble.hint { align-self: center; background: none; border: 1px dashed var(--line);
+                 color: var(--muted); font-size: 13px; }
+  form {
+    display: flex; gap: 10px; padding: 12px 16px;
+    border-top: 1px solid var(--line); background: var(--panel);
+  }
+  form textarea {
+    flex: 1; resize: none; font: inherit; padding: 9px 12px; border-radius: 8px;
+    border: 1px solid var(--line); background: var(--bg); color: var(--text);
+  }
+  .status { padding: 0 16px 8px; font-size: 12px; color: var(--muted); background: var(--panel); }
+  .status[data-kind="error"] { color: var(--bad); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Agent Gateway</h1>
+  <div class="meta"><span id="session-label">会话：准备中…</span></div>
+  <button id="new-session" type="button">新会话</button>
+</header>
+
+<section class="auth">
+  <label for="token">访问 token</label>
+  <input id="token" type="password" autocomplete="off" placeholder="服务端设置了 GATEWAY_TOKEN 时填写">
+  <button id="save-token" type="button">保存</button>
+  <p class="note" id="auth-note"></p>
+</section>
+
+<main id="messages" aria-live="polite"></main>
+
+<form id="composer">
+  <textarea id="input" rows="2" placeholder="输入问题，Enter 发送，Shift+Enter 换行"></textarea>
+  <button id="send" class="primary" type="submit">发送</button>
+</form>
+<div id="status" class="status" role="status"></div>
+
+<script>
+"use strict";
+
+const TOKEN_KEY = "ydd_gateway_token";
+const SESSION_KEY = "ydd_gateway_session";
+
+const state = {
+  token: localStorage.getItem(TOKEN_KEY) || "",
+  sessionId: localStorage.getItem(SESSION_KEY) || "",
+  busy: false,
+};
+
+const el = {
+  sessionLabel: document.getElementById("session-label"),
+  newSession: document.getElementById("new-session"),
+  token: document.getElementById("token"),
+  saveToken: document.getElementById("save-token"),
+  authNote: document.getElementById("auth-note"),
+  messages: document.getElementById("messages"),
+  composer: document.getElementById("composer"),
+  input: document.getElementById("input"),
+  send: document.getElementById("send"),
+  status: document.getElementById("status"),
+};
+
+function setStatus(text, kind) {
+  el.status.textContent = text;
+  el.status.dataset.kind = kind || "";
+}
+
+function errorMessage(payload, status) {
+  return (payload && payload.error && payload.error.message) || `请求失败（HTTP ${status}）`;
+}
+
+/** 统一的 HTTP 调用：带上 token，失败时抛出带 status 的 Error。 */
+async function request(path, options) {
+  const settings = options || {};
+  const headers = { "Content-Type": "application/json" };
+  if (state.token) headers.Authorization = `Bearer ${state.token}`;
+  const response = await fetch(path, { method: settings.method || "GET",
+                                        headers, body: settings.body });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(errorMessage(payload, response.status));
+    error.status = response.status;
+    throw error;
+  }
+  return payload;
+}
+
+/** 追加一条纯文本气泡；不使用 innerHTML，避免把模型输出当 HTML 执行。 */
+function addBubble(role, text) {
+  const bubble = document.createElement("div");
+  bubble.className = `bubble ${role}`;
+  bubble.textContent = text;
+  el.messages.append(bubble);
+  el.messages.scrollTop = el.messages.scrollHeight;
+  return bubble;
+}
+
+function appendText(bubble, text) {
+  bubble.textContent += text;
+  el.messages.scrollTop = el.messages.scrollHeight;
+}
+
+/** 开始提问后，把“新会话已就绪”这类提示气泡清掉，保持对话区干净。 */
+function clearHints() {
+  for (const hint of el.messages.querySelectorAll(".bubble.hint")) hint.remove();
+}
+
+function showSession() {
+  el.sessionLabel.textContent = `会话：${state.sessionId}`;
+}
+
+/** 复用已保存的会话；服务端数据被清理过（404）时自动新建一个。 */
+async function ensureSession() {
+  if (state.sessionId) {
+    try {
+      await request(`/sessions/${state.sessionId}`);
+      showSession();
+      return state.sessionId;
+    } catch (error) {
+      if (error.status !== 404) throw error;
+      state.sessionId = "";
+      localStorage.removeItem(SESSION_KEY);
+    }
+  }
+  const session = await request("/sessions", {
+    method: "POST",
+    body: JSON.stringify({ title: "浏览器会话" }),
+  });
+  state.sessionId = session.id;
+  localStorage.setItem(SESSION_KEY, session.id);
+  showSession();
+  return state.sessionId;
+}
+
+async function loadHistory() {
+  el.messages.textContent = "";
+  const rows = await request(`/sessions/${state.sessionId}/messages?limit=200`);
+  if (!rows.length) {
+    addBubble("hint", "新会话已就绪，输入问题开始对话。");
+    return;
+  }
+  for (const row of rows) addBubble(row.role, row.content);
+}
+
+/**
+ * 一次提问 = 一张新票据 + 一条新 WebSocket 连接。
+ * 票据只能用一次，所以每条消息都重新取票；连接成功后立即发送内容。
+ */
+async function ask(content) {
+  const ticket = await request(`/sessions/${state.sessionId}/ticket`, { method: "POST" });
+  const scheme = location.protocol === "https:" ? "wss" : "ws";
+  const url = `${scheme}://${location.host}/sessions/${state.sessionId}`
+            + `/stream?ticket=${encodeURIComponent(ticket.ticket)}`;
+
+  return new Promise((resolve, reject) => {
+    const socket = new WebSocket(url);
+    const bubble = addBubble("assistant", "");
+    let reply = "";
+    let settled = false;
+
+    function finish(action, value) {
+      if (settled) return;
+      settled = true;
+      action(value);
+    }
+
+    socket.onopen = () => socket.send(JSON.stringify({ content }));
+
+    socket.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      if (data.type === "start") {
+        setStatus("正在生成…", "busy");
+        // 服务端可能为了适配上下文丢掉早期对话，告诉用户一声，免得以为模型失忆。
+        if (data.context && data.context.trimmed_messages > 0) {
+          const notice = document.createElement("div");
+          notice.className = "bubble hint";
+          notice.textContent =
+            `已省略最早的 ${data.context.trimmed_messages} 条消息，以适配模型上下文。`;
+          bubble.before(notice);
+        }
+      } else if (data.type === "delta") {
+        reply += data.content;
+        appendText(bubble, data.content);
+      } else if (data.type === "done") {
+        // 重放成功结果时没有 delta，直接把完整回答放进去。
+        if (!reply) appendText(bubble, data.reply || "");
+        setStatus(data.replayed ? "这一问之前已经回答过，直接复用了结果" : "完成", "ok");
+        socket.close();
+        finish(resolve);
+      } else if (data.type === "error") {
+        appendText(bubble, data.error.message);
+        bubble.classList.add("error");
+        setStatus("生成失败", "error");
+        socket.close();
+        finish(reject, new Error(data.error.message));
+      }
+    };
+
+    socket.onerror = () => finish(reject, new Error("连接失败，请检查服务是否仍在运行。"));
+
+    socket.onclose = () => {
+      // 没有收到 done 就断开，说明这一轮没有完整结果，不能当成成功。
+      finish(reject, new Error("连接在回答完成前关闭，本轮未完成。"));
+    };
+  });
+}
+
+async function start() {
+  el.token.value = state.token;
+  try {
+    const health = await fetch("/health").then((response) => response.json());
+    el.authNote.textContent = health.auth_required
+      ? "服务端已启用 token 校验，请填写后保存。"
+      : "服务端未设置 token，本机可直接使用。";
+    await ensureSession();
+    await loadHistory();
+    setStatus("就绪", "ok");
+  } catch (error) {
+    if (error.status === 401) {
+      setStatus("token 不正确，请在上方填写后保存。", "error");
+      el.token.focus();
+    } else {
+      setStatus(error.message, "error");
+    }
+  }
+}
+
+el.composer.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const content = el.input.value.trim();
+  if (!content || state.busy) return;
+  state.busy = true;
+  el.send.disabled = true;
+  el.input.value = "";
+  clearHints();
+  addBubble("user", content);
+  try {
+    await ask(content);
+  } catch (error) {
+    setStatus(error.message, "error");
+  } finally {
+    state.busy = false;
+    el.send.disabled = false;
+    el.input.focus();
+  }
+});
+
+el.input.addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && !event.shiftKey) {
+    event.preventDefault();
+    el.composer.requestSubmit();
+  }
+});
+
+el.saveToken.addEventListener("click", () => {
+  state.token = el.token.value.trim();
+  localStorage.setItem(TOKEN_KEY, state.token);
+  start();
+});
+
+el.newSession.addEventListener("click", () => {
+  state.sessionId = "";
+  localStorage.removeItem(SESSION_KEY);
+  el.messages.textContent = "";
+  start();
+});
+
+start();
+</script>
+</body>
+</html>
