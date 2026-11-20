@@ -77,7 +77,8 @@
 | `gateway/service.py` | 唯一的编排入口，HTTP 与 WS 共用 | `ChatService.stream`（异步生成器） | 不解析 SSE、不拼 SQL |
 | `gateway/context.py` | token 估算、按预算组装消息、超限报 413 | `estimate_tokens`、`build_context`、`PreparedContext` | 无 I/O、无状态 |
 | `gateway/provider.py` | demo 回显、兼容 Chat Completions 的流式调用 | `ModelProvider.stream`、`_sse_data` | 不写库、不改历史 |
-| `gateway/storage.py` | SQLite 表、索引、事务、查询 | `Store`（全同步方法） | 不 import `service`，不知道 HTTP |
+| `gateway/proxy.py` | 可选的反向代理：路由表、HTTP 流式转发、WebSocket 双向桥接 | `ProxyRoute`、`Proxy`、`load_routes` | 不解析上游语义、不做负载均衡 |
+| `gateway/storage.py` | SQLite 表、迁移、索引、事务、查询 | `Store`、`MIGRATIONS` | 不 import `service`，不知道 HTTP |
 | `gateway/tickets.py` | 一次性票据的签发与核销 | `TicketStore`、`TICKET_SECONDS` | 不持久化、不加锁（单事件循环） |
 | `gateway/config.py` | 读环境变量 / `.env`，启动时校验 | `Settings`、`read_flag` | 不做运行时热更新 |
 | `gateway/errors.py` | 统一业务错误 | `GatewayError(status_code, code, message)` | 不含 HTTP 细节 |
@@ -92,6 +93,7 @@ flowchart TD
     service["service.py<br/>编排"]
     context["context.py<br/>估算与裁剪"]
     provider["provider.py<br/>模型调用"]
+    proxy["proxy.py<br/>反向代理"]
     tickets["tickets.py<br/>一次性票据"]
     storage["storage.py<br/>SQLite"]
     config["config.py<br/>配置"]
@@ -103,6 +105,7 @@ flowchart TD
     app --> tickets
     app --> config
     app --> errors
+    app --> proxy
     app -.->|"GET / 返回文件"| web
     service --> context
     service --> provider
@@ -112,6 +115,7 @@ flowchart TD
     context --> errors
     provider --> config
     provider --> errors
+    proxy --> errors
     storage --> errors
 ```
 
@@ -215,6 +219,44 @@ sequenceDiagram
 ```
 
 `take()` 无论成功失败都会删除票据；用错会话也会作废（避免拿 A 的票反复试探 B）。
+
+### 4.4 反向代理（可选能力）
+
+`routes.json` 存在时，`create_app` 会为每个前缀注册同名的 HTTP 与 WebSocket 路由；文件不存在则完全不注册，内置接口零影响。
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as 客户端
+    participant A as app.py（代理路由）
+    participant P as proxy.py
+    participant U as 上游服务
+
+    C->>A: GET /finance/report（Bearer）
+    A->>A: require_auth（与其他接口一致）
+    A->>P: forward(request, route, "report")
+    P->>P: 去掉逐跳头 / 网关 token / 回环标记
+    P->>U: GET http://127.0.0.1:9001/report + X-Gateway-Proxy: 1
+    U-->>P: 200 + 响应体（可以是流）
+    P-->>C: StreamingResponse（状态码与头原样）
+```
+
+WebSocket 走同一套前缀，但握手方式不同：
+
+```text
+客户端 --WS /finance/live--> 网关（校验 Bearer）--> 上游 ws://127.0.0.1:9001/live
+                                        ├── 客户端帧 → 上游
+                                        └── 上游帧 → 客户端
+```
+
+关键点：
+
+- **HTTP 用 `aiter_raw` 流式回写**，上游是 SSE 或大文件时不会被整体读进内存；
+- **WS 用两条协程双向搬运**，任意一侧结束就收尾，并把上游的关闭码映射成 Starlette 允许的码（1006 之类改成 1011）；
+- **子协议**：客户端请求的 `Sec-WebSocket-Protocol` 会透传给上游，再把上游选中的那个回给客户端（`accept(subprotocol=...)`）；
+- **网关 token 不外泄**：`Authorization` 不转发；需要给上游带凭据就在路由里配 `headers`；
+- **回环识别**：代理给上游请求加 `X-Gateway-Proxy: 1`，如果进来的请求已经带这个头，直接 `508`；
+- **目标只来自配置**，客户端无法指定 URL，因此不存在 SSRF 面。
 
 ## 5. 并发与一致性
 
@@ -497,3 +539,6 @@ get_session → find_request → messages → start_run → complete_run/fail_ru
 | 历史不压缩 | 早期对话只能被丢弃 | 超预算 |
 | 列表无缓存语义 | 无 ETag / 条件请求，每次全量返回 | 高频轮询列表 |
 | 无工具调用 | 只能文本问答 | 需要函数调用 |
+| 代理只覆盖 HTTP/WS | gRPC、TCP 等协议不能经网关转发 | 需要代理非 HTTP 服务 |
+| 代理无负载均衡 | 一个前缀只能指向一个上游，没有权重与故障转移 | 需要多实例分流 |
+| 代理 WS 需请求头鉴权 | 浏览器原生 WebSocket 无法连代理前缀 | 浏览器访问被代理的实时服务 |

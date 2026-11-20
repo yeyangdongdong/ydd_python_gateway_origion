@@ -11,7 +11,7 @@ from uuid import uuid4
 import anyio
 from fastapi import Depends, FastAPI, Header, Query, Request, WebSocket
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError
 from starlette.concurrency import run_in_threadpool
 from starlette.websockets import WebSocketDisconnect
@@ -19,6 +19,7 @@ from starlette.websockets import WebSocketDisconnect
 from .config import Settings
 from .errors import GatewayError
 from .provider import ModelProvider
+from .proxy import PROXY_METHODS, Proxy, load_routes
 from .service import ChatService
 from .storage import Store
 from .tickets import TicketStore
@@ -68,16 +69,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
     store = Store(settings.db_path)
     tickets = TicketStore()
+    # 启动时就把路由表读进内存：配置写错立刻报错，而不是等第一个请求。
+    routes = load_routes(settings.routes_path)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         await run_in_threadpool(store.initialize, settings.model)
         provider = ModelProvider(settings)
         app.state.chat = ChatService(store, provider, settings)
+        app.state.proxy = Proxy(routes, settings.proxy_timeout) if routes else None
         try:
             yield
         finally:
             await provider.close()
+            if app.state.proxy is not None:
+                await app.state.proxy.close()
 
     app = FastAPI(title="ydd_python_gateway_origion", version="0.1.0",
                   description="易于理解的 Python Agent Gateway 基础版。", lifespan=lifespan)
@@ -295,5 +301,36 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             with anyio.CancelScope(shield=True):
                 with suppress(asyncio.CancelledError, WebSocketDisconnect):
                     await worker
+
+    # 可选的反向代理：按 routes.json 为每个前缀注册 HTTP 与 WebSocket 转发路由。
+    # 放在最后注册，内置接口优先，不会被前缀遮蔽（加载时也已拒绝冲突前缀）。
+    def make_forwarder(route):
+        async def forward(request: Request, path: str) -> Response:
+            return await request.app.state.proxy.forward(request, route, path)
+        return forward
+
+    def make_ws_forwarder(route):
+        async def forward(websocket: WebSocket, path: str) -> None:
+            # 代理的 WS 走握手头鉴权：浏览器设不了请求头，内置聊天页另有票据机制。
+            if not authorized(websocket.headers.get("authorization")):
+                await websocket.close(code=1008)
+                return
+            await websocket.app.state.proxy.forward_websocket(websocket, route, path)
+        return forward
+
+    for index, route in enumerate(routes):
+        handler = make_forwarder(route)
+        handler.__name__ = f"proxy_{index}"
+        # 每个方法单独注册：FastAPI 对多方法路由只生成一个 operationId，
+        # 拆开之后 /docs 与代码生成工具里的每个入口都是唯一的。
+        for method in PROXY_METHODS:
+            app.api_route(route.prefix + "{path:path}", methods=[method],
+                          name=f"proxy_{index}_{method.lower()}",
+                          dependencies=auth)(handler)
+
+        ws_handler = make_ws_forwarder(route)
+        ws_handler.__name__ = f"proxy_ws_{index}"
+        app.add_api_websocket_route(route.prefix + "{path:path}", ws_handler,
+                                    name=f"proxy_ws_{index}")
 
     return app

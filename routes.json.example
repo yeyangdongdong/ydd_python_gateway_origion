@@ -1,0 +1,14 @@
+{
+  "routes": [
+    {
+      "prefix": "/finance/",
+      "target": "http://127.0.0.1:9001",
+      "strip_prefix": true
+    },
+    {
+      "prefix": "/motion/",
+      "target": "http://127.0.0.1:9002",
+      "strip_prefix": true
+    }
+  ]
+}

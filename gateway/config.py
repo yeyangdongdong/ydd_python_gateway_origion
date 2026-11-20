@@ -44,6 +44,9 @@ class Settings:
     context_tokens: int = 8192
     # 默认不读取系统代理：本机模型服务（127.0.0.1）常被代理拦截并返回 502。
     use_system_proxy: bool = False
+    # 可选的反向代理：路由表文件与上游超时。文件不存在表示不启用。
+    routes_path: Path = PROJECT_DIR / "routes.json"
+    proxy_timeout: float = 30.0
 
     def __post_init__(self) -> None:
         if self.provider not in {"demo", "openai"}:
@@ -65,6 +68,8 @@ class Settings:
         if self.max_tokens + 256 > self.context_tokens:
             raise ValueError("MODEL_CONTEXT_TOKENS 需要比 MODEL_MAX_TOKENS 至少大 256，"
                              "否则没有空间容纳系统提示词和历史。")
+        if not math.isfinite(self.proxy_timeout) or self.proxy_timeout <= 0:
+            raise ValueError("GATEWAY_PROXY_TIMEOUT 必须是大于 0 的有限数字。")
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -73,13 +78,17 @@ class Settings:
         database = Path(os.getenv("GATEWAY_DB_PATH", "data/gateway.sqlite3"))
         if not database.is_absolute():
             database = PROJECT_DIR / database
+        routes = Path(os.getenv("GATEWAY_ROUTES_PATH", "routes.json"))
+        if not routes.is_absolute():
+            routes = PROJECT_DIR / routes
         try:
             timeout = float(os.getenv("MODEL_TIMEOUT_SECONDS", "60"))
             max_tokens = int(os.getenv("MODEL_MAX_TOKENS", "2048"))
             context_tokens = int(os.getenv("MODEL_CONTEXT_TOKENS", "8192"))
+            proxy_timeout = float(os.getenv("GATEWAY_PROXY_TIMEOUT", "30"))
         except ValueError as exc:
-            raise ValueError("MODEL_TIMEOUT_SECONDS 应为数字，MODEL_MAX_TOKENS 和 "
-                             "MODEL_CONTEXT_TOKENS 应为整数。") from exc
+            raise ValueError("MODEL_TIMEOUT_SECONDS、GATEWAY_PROXY_TIMEOUT 应为数字，"
+                             "MODEL_MAX_TOKENS 和 MODEL_CONTEXT_TOKENS 应为整数。") from exc
         return cls(
             provider=os.getenv("GATEWAY_PROVIDER", "demo").strip().lower(),
             model=os.getenv("MODEL_NAME", "demo").strip(),
@@ -91,4 +100,6 @@ class Settings:
             max_tokens=max_tokens,
             context_tokens=context_tokens,
             use_system_proxy=read_flag("MODEL_USE_SYSTEM_PROXY", False),
+            routes_path=routes,
+            proxy_timeout=proxy_timeout,
         )

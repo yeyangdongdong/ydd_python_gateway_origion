@@ -1,5 +1,6 @@
 """从真实 HTTP/WS 入口验证行为；模型替身是独立的本地 HTTP SSE 服务。"""
 
+import asyncio
 import json
 import os
 import queue
@@ -16,6 +17,7 @@ from unittest import mock
 
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
+from websockets.asyncio.server import serve
 
 from gateway.app import create_app
 from gateway.config import Settings
@@ -62,12 +64,87 @@ class ModelStub(BaseHTTPRequestHandler):
             pass  # 客户端中断本来就是测试的输入。
 
 
+class EchoStub(BaseHTTPRequestHandler):
+    """反向代理测试用的最小上游：回显路径，并记录收到的请求头。"""
+
+    requests = queue.Queue()
+
+    def log_message(self, format, *args):
+        pass
+
+    def _handle(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length) if length else b""
+        EchoStub.requests.put({
+            "method": self.command,
+            "path": self.path,
+            "authorization": self.headers.get("Authorization"),
+            "loop": self.headers.get("X-Gateway-Proxy"),
+            "body": body.decode("utf-8", "replace"),
+        })
+        if self.path.startswith("/slow"):
+            time.sleep(0.5)          # 用来触发代理超时
+        payload = json.dumps({"path": self.path, "method": self.command},
+                             ensure_ascii=False).encode()
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass  # 代理超时后会主动断开，这属于测试预期。
+
+    do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = _handle
+
+
+class WsEchoUpstream:
+    """独立的 WebSocket 回显服务，跑在自己的线程和事件循环里。"""
+
+    def __init__(self):
+        self.port = None
+        self.ready = threading.Event()
+        self.loop = asyncio.new_event_loop()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+        if not self.ready.wait(timeout=5):
+            raise RuntimeError("WS 上游未能启动")
+
+    def _run(self):
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_until_complete(self._start())
+        self.loop.run_forever()
+
+    async def _start(self):
+        self.server = await serve(self._echo, "127.0.0.1", 0)
+        self.port = self.server.sockets[0].getsockname()[1]
+        self.ready.set()
+
+    async def _echo(self, websocket):
+        await websocket.send(f"path:{websocket.request.path}")
+        async for message in websocket:
+            await websocket.send(f"echo:{message}")
+
+    def close(self):
+        async def stop():
+            self.server.close()
+            await self.server.wait_closed()
+
+        asyncio.run_coroutine_threadsafe(stop(), self.loop).result(timeout=5)
+        self.loop.call_soon_threadsafe(self.loop.stop)
+        self.thread.join(timeout=5)
+
+
 class GatewayTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model_server = ThreadingHTTPServer(("127.0.0.1", 0), ModelStub)
         cls.model_thread = threading.Thread(target=cls.model_server.serve_forever, daemon=True)
         cls.model_thread.start()
+        cls.echo_server = ThreadingHTTPServer(("127.0.0.1", 0), EchoStub)
+        cls.echo_thread = threading.Thread(target=cls.echo_server.serve_forever, daemon=True)
+        cls.echo_thread.start()
+        cls.ws_upstream = WsEchoUpstream()
 
     @classmethod
     def tearDownClass(cls):
@@ -75,6 +152,10 @@ class GatewayTests(unittest.TestCase):
         cls.model_server.shutdown()
         cls.model_server.server_close()
         cls.model_thread.join(timeout=5)
+        cls.echo_server.shutdown()
+        cls.echo_server.server_close()
+        cls.echo_thread.join(timeout=5)
+        cls.ws_upstream.close()
 
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory(prefix="ydd-gateway-test-")
@@ -82,14 +163,28 @@ class GatewayTests(unittest.TestCase):
         ModelStub.requests = queue.Queue()
         ModelStub.slow_started.clear()
         ModelStub.release_slow.clear()
+        EchoStub.requests = queue.Queue()
         self.addCleanup(ModelStub.release_slow.set)
         self.settings = Settings(
             provider="openai", model="fixture-model", api_key="synthetic-model-key",
             gateway_token="synthetic-gateway-key",
             base_url=f"http://127.0.0.1:{self.model_server.server_port}/v1",
             db_path=Path(self.directory.name) / "gateway.sqlite3", request_timeout=5,
+            # 默认指向不存在的文件，保证每个用例都不受本地 routes.json 影响。
+            routes_path=Path(self.directory.name) / "routes.json",
         )
         self.auth = {"Authorization": "Bearer synthetic-gateway-key"}
+
+    @property
+    def echo_target(self):
+        return f"http://127.0.0.1:{self.echo_server.server_port}"
+
+    def routed_client(self, routes, headers=None, **overrides):
+        """写一份临时路由表并返回已启用代理的客户端。"""
+        path = Path(self.directory.name) / "routes.json"
+        path.write_text(json.dumps({"routes": routes}, ensure_ascii=False), encoding="utf-8")
+        settings = replace(self.settings, routes_path=path, **overrides)
+        return TestClient(create_app(settings), headers=self.auth if headers is None else headers)
 
     def client(self):
         return TestClient(create_app(self.settings), headers=self.auth)
@@ -649,6 +744,96 @@ class GatewayTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"MODEL_USE_SYSTEM_PROXY": "maybe"}):
             with self.assertRaises(ValueError):
                 Settings.from_env()
+
+    def test_proxy_forwards_http_and_strips_prefix(self):
+        with self.routed_client([{"prefix": "/echo/", "target": self.echo_target}]) as client:
+            response = client.post("/echo/items?x=1&y=2", json={"hello": "world"})
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json()["path"], "/items?x=1&y=2")
+
+        seen = EchoStub.requests.get_nowait()
+        self.assertEqual(seen["method"], "POST")
+        self.assertEqual(json.loads(seen["body"]), {"hello": "world"})
+        self.assertIsNone(seen["authorization"])   # 网关自己的 token 不能泄露给上游
+        self.assertEqual(seen["loop"], "1")
+
+    def test_proxy_can_keep_prefix(self):
+        with self.routed_client([{"prefix": "/echo/", "target": self.echo_target,
+                                  "strip_prefix": False}]) as client:
+            self.assertEqual(client.get("/echo/a/b").status_code, 200)
+        self.assertEqual(EchoStub.requests.get_nowait()["path"], "/echo/a/b")
+
+    def test_proxy_requires_gateway_token(self):
+        with self.routed_client([{"prefix": "/echo/", "target": self.echo_target}],
+                                headers={}) as client:
+            self.assertEqual(client.get("/echo/x").status_code, 401)
+            with self.assertRaises(WebSocketDisconnect) as denied:
+                with client.websocket_connect("/echo/ws"):
+                    pass
+            self.assertEqual(denied.exception.code, 1008)
+
+    def test_proxy_stays_disabled_without_routes_file(self):
+        with self.client() as client:
+            self.assertEqual(client.get("/finance/anything").status_code, 404)
+
+    def test_proxy_websocket_passthrough(self):
+        target = f"http://127.0.0.1:{self.ws_upstream.port}"
+        with self.routed_client([{"prefix": "/echo/", "target": target}]) as client:
+            with client.websocket_connect("/echo/ws") as websocket:
+                self.assertEqual(websocket.receive_text(), "path:/ws")
+                websocket.send_text("hi")
+                self.assertEqual(websocket.receive_text(), "echo:hi")
+
+    def test_proxy_upstream_failures(self):
+        dead = "http://127.0.0.1:1"
+        with self.routed_client([{"prefix": "/dead/", "target": dead}]) as client:
+            response = client.get("/dead/x")
+            self.assertEqual(response.status_code, 502)
+            self.assertEqual(response.json()["error"]["code"], "upstream_unreachable")
+
+            with client.websocket_connect("/dead/ws") as websocket:
+                event = websocket.receive_json()
+                self.assertEqual(event["type"], "error")
+                self.assertEqual(event["status"], 502)
+                self.assertEqual(event["error"]["code"], "upstream_unreachable")
+                self.assertNotIn("session_id", event)   # 代理 WS 不是会话级连接
+
+    def test_proxy_timeout_maps_to_504(self):
+        with self.routed_client([{"prefix": "/echo/", "target": self.echo_target}],
+                                proxy_timeout=0.1) as client:
+            response = client.get("/echo/slow")
+            self.assertEqual(response.status_code, 504, response.text)
+            self.assertEqual(response.json()["error"]["code"], "upstream_timeout")
+
+    def test_proxy_loop_guard(self):
+        with self.routed_client([{"prefix": "/echo/", "target": self.echo_target}]) as client:
+            response = client.get("/echo/x", headers={**self.auth, "X-Gateway-Proxy": "1"})
+            self.assertEqual(response.status_code, 508)
+            self.assertEqual(response.json()["error"]["code"], "proxy_loop")
+
+    def test_proxy_route_file_tolerates_bom(self):
+        # Windows 记事本 / PowerShell 的 Set-Content 会写 UTF-8 BOM。
+        path = Path(self.directory.name) / "bom-routes.json"
+        payload = json.dumps({"routes": [{"prefix": "/echo/", "target": self.echo_target}]})
+        path.write_text(payload, encoding="utf-8-sig")
+        with TestClient(create_app(replace(self.settings, routes_path=path)),
+                        headers=self.auth) as client:
+            self.assertEqual(client.get("/echo/x").status_code, 200)
+
+    def test_proxy_route_config_is_validated(self):
+        cases = {
+            "非法 prefix": [{"prefix": "finance/", "target": "http://127.0.0.1:1"}],
+            "与内置接口冲突": [{"prefix": "/sessions/", "target": "http://127.0.0.1:1"}],
+            "非法 target": [{"prefix": "/a/", "target": "ftp://127.0.0.1:1"}],
+            "prefix 重复": [{"prefix": "/a/", "target": "http://127.0.0.1:1"},
+                            {"prefix": "/a/", "target": "http://127.0.0.1:2"}],
+        }
+        for label, routes in cases.items():
+            with self.subTest(case=label):
+                path = Path(self.directory.name) / "bad-routes.json"
+                path.write_text(json.dumps({"routes": routes}, ensure_ascii=False), encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    create_app(replace(self.settings, routes_path=path))
 
 
 if __name__ == "__main__":

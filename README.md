@@ -303,6 +303,8 @@ Agent、会话、消息和运行记录均保存在 SQLite。成功后，助手�
 | `MODEL_MAX_TOKENS` | `2048` | 传给模型的 `max_tokens` 输出上限 |
 | `MODEL_CONTEXT_TOKENS` | `8192` | 模型上下文窗口总长度（提示词 + 回答）；历史按它裁剪，必须比 `MODEL_MAX_TOKENS` 至少大 256 |
 | `MODEL_USE_SYSTEM_PROXY` | `false` | 是否让模型请求走系统代理。访问本机或内网模型服务时必须保持 `false`；只有需要经代理访问远程服务时才设为 `true` |
+| `GATEWAY_ROUTES_PATH` | `routes.json` | 反向代理路由表位置，相对路径以项目根目录为基准；文件不存在表示不启用 |
+| `GATEWAY_PROXY_TIMEOUT` | `30` | 反向代理访问上游的超时秒数（独立于模型超时） |
 
 `run.py` 默认只监听 `127.0.0.1:8000`。需要局域网访问时，先设置非空 `GATEWAY_TOKEN`，再运行 `python run.py --host 0.0.0.0`；跨不可信网络应通过 HTTPS/WSS 反向代理或受保护的隧道访问。不要把 `.env` 或数据库提交到代码仓库。
 
@@ -316,7 +318,8 @@ ydd_python_gateway_origion/
 │   ├── service.py              # 排队、历史、裁剪、模型调用、保存和去重
 │   ├── context.py              # token 估算和按预算裁剪历史
 │   ├── provider.py             # 演示模型、兼容模型和 SSE 解析
-│   ├── storage.py              # SQLite 表和读写操作
+│   ├── proxy.py                # 可选的反向代理（HTTP 与 WebSocket 转发）
+│   ├── storage.py              # SQLite 表、迁移和读写操作
 │   ├── tickets.py              # 浏览器连接 WebSocket 用的一次性票据
 │   ├── config.py               # 配置加载和检查
 │   └── errors.py               # 共用错误类型
@@ -325,6 +328,7 @@ ydd_python_gateway_origion/
 ├── docs/                       # 技术文档：架构、接口、决策、开发
 ├── examples/                   # HTTP、WebSocket 与管理接口示例
 ├── tests/                      # 自动化测试
+├── routes.json.example         # 反向代理路由模板
 ├── .env.example                # 配置模板
 └── requirements.txt            # Python 依赖
 ```
@@ -339,7 +343,40 @@ ydd_python_gateway_origion/
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-## 10. 基础版范围
+## 10. 反向代理（可选）
+
+如果还有别的本地服务想走同一个入口（统一地址、统一 token），在项目根目录新建 `routes.json`（可从 `routes.json.example` 复制）：
+
+```json
+{
+  "routes": [
+    {"prefix": "/finance/", "target": "http://127.0.0.1:9001", "strip_prefix": true}
+  ]
+}
+```
+
+重启网关后：
+
+- `GET /finance/report` 转发到 `http://127.0.0.1:9001/report`（`strip_prefix` 为 `true` 时去掉前缀，设为 `false` 则保留成 `/finance/report`）；
+- 同一前缀下的 **WebSocket** 也会被转发，例如 `ws://127.0.0.1:8000/finance/live`。代理的 WS 用 `Authorization` 头鉴权，所以面向 Python、命令行等能设头的客户端；浏览器原生 WebSocket 设不了头，内置聊天页走的是另一套会话票据，不经过这里；
+- 路径、查询串、请求体、状态码、响应头原样转发；上游的 4xx/5xx 也原样返回，不会被改写成网关自己的错误；
+- 网关自己的 token **不会**转发给上游；需要给上游带凭据时，在路由里加 `"headers": {"X-Api-Key": "..."}`；
+- 响应是流式转发的，SSE、大文件和慢接口都不会被整体读进内存。
+
+几条边界：
+
+| 行为 | 说明 |
+| --- | --- |
+| 鉴权 | 与其他业务接口一致：设置了 `GATEWAY_TOKEN` 就必须带 `Authorization` |
+| 回环保护 | 上游又指回网关自己时返回 `508 proxy_loop`（代理会给请求加 `X-Gateway-Proxy: 1` 用作识别） |
+| 超时 | `GATEWAY_PROXY_TIMEOUT`，默认 30 秒，独立于模型超时 |
+| 上游连不上 / 超时 | `502 upstream_unreachable` / `504 upstream_timeout` |
+| 前缀冲突 | 与 `/sessions`、`/agents`、`/runs`、`/health`、`/docs` 冲突的前缀在启动时直接拒绝 |
+| 文件不存在 | 不启用反向代理，对内置接口零影响 |
+
+`routes.json` 已被 `.gitignore` 忽略（每台机器的端口不同），模板 `routes.json.example` 会提交。Windows 上用记事本或 PowerShell 保存带 BOM 的文件也能正常读取。
+
+## 11. 基础版范围
 
 这是独立的简化 Gateway，借鉴 OpenClaw 的职责划分，使用自己的 API。它不能直接替换 OpenClaw Gateway，也不兼容现有 OpenClaw Control UI、CLI、配对和 RPC 协议。
 

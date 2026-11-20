@@ -263,6 +263,32 @@ Agent 是"名称 + 系统提示词 + 模型名"的组合。默认 Agent（`id=de
 
 同上结构，按运行 ID 查询。不存在 → `404 run_not_found`。
 
+### 2.8 反向代理前缀（按 `routes.json` 动态注册）
+
+只有配置了 `routes.json` 才存在，路径由配置决定，因此不出现在 `/docs` 的固定接口里（但会作为 `/prefix/{path}` 出现）。
+每个前缀同时接受 HTTP 的全部方法与 WebSocket。
+
+```text
+GET   /finance/report?x=1   →  http://127.0.0.1:9001/report?x=1     （strip_prefix: true）
+WS    /finance/live         →  ws://127.0.0.1:9001/live
+```
+
+| 规则 | 说明 |
+| --- | --- |
+| 鉴权 | 与其他业务接口相同：设置了 `GATEWAY_TOKEN` 就必须带 `Authorization`；WS 同样走握手头 |
+| 转发内容 | 方法、路径、查询串、请求体、状态码、响应头；上游的 4xx/5xx 原样返回 |
+| 不转发 | 逐跳头（`connection`、`transfer-encoding` 等）、`host`、`content-length`、网关的 `Authorization` |
+| 注入 | 网关自动加 `X-Gateway-Proxy: 1`；路由配置里的 `headers` 会合并进上游请求 |
+| 流式 | 响应边收边转发，SSE 与大文件不会被整体缓冲 |
+| 超时 | `GATEWAY_PROXY_TIMEOUT`，默认 30 秒 |
+| 错误 | `502 upstream_unreachable`、`504 upstream_timeout`、`508 proxy_loop` |
+
+代理 WS 的错误事件与会话流同形状，只是没有 `session_id`（不是会话级连接）：
+
+```json
+{"type":"error","status":502,"error":{"code":"upstream_unreachable","message":"无法连接上游 http://127.0.0.1:9001 的 WebSocket。"}}
+```
+
 ## 3. WebSocket 协议
 
 ### 3.1 连接
@@ -356,6 +382,9 @@ GATEWAY_TOKEN 为空        → 直接放行（不看票据）
 | 502 | `model_connection_error` | 连接失败/被中断 | 检查 `MODEL_BASE_URL`、网络、代理设置 |
 | 503 | `model_rate_limited` | 上游 429 | 降低频率或检查额度 |
 | 504 | `model_timeout` | 上游超时（连接/读/整轮） | 检查服务或调大 `MODEL_TIMEOUT_SECONDS` |
+| 502 | `upstream_unreachable` | 反向代理连不上上游（HTTP 或 WS） | 确认上游服务在运行、端口与地址正确 |
+| 504 | `upstream_timeout` | 反向代理访问上游超时 | 检查上游性能，或调大 `GATEWAY_PROXY_TIMEOUT` |
+| 508 | `proxy_loop` | 上游又指回了网关自己（请求带着 `X-Gateway-Proxy`） | 修正 `routes.json` 里的目标地址 |
 
 ## 5. `context` 对象
 
