@@ -364,6 +364,12 @@ WS    /finance/live         →  ws://127.0.0.1:9001/live
 | GET | `/api-keys` | 列出 API Key（管理员；不含明文） |
 | POST | `/api-keys` | `{"name","scopes","expires_in_days"}` → 返回一次性明文（管理员） |
 | DELETE | `/api-keys/{key_id}` | 撤销（管理员）；不存在或已撤销 → 404 |
+| GET | `/users` | 用户列表（管理员） |
+| POST | `/users` | `{"username","password","role"}`（管理员；密码策略见 README） |
+| PATCH | `/users/{user_id}` | `{"role"?, "status"?}`；最后一个管理员被保护 → 409 `last_admin` |
+| POST | `/users/{user_id}/reset-password` | `{"password"}` → 重置并吊销该用户会话 |
+| DELETE | `/users/{user_id}/sessions` | 吊销该用户全部会话 |
+| POST | `/auth/password` | `{"current_password","new_password"}`，仅登录会话可用；保留当前会话 |
 
 API Key 认证：`Authorization: Bearer ydd_<id>_<secret>`，按资源检查 scope：
 `sessions` / `agents` / `audit` / `proxy`。缺少 scope → `403 forbidden`；Key 不能管理 Key。

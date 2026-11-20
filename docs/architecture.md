@@ -452,7 +452,8 @@ remaining   = budget − fixed − notice
 - **密码**：stdlib `hashlib.scrypt`（n=2^14, r=8, p=1，16 字节盐）；用户不存在时也跑一次哈希防枚举。
 - **会话**：不透明 token，服务端可吊销；登出/重置密码立即失效；`last_seen_at` 最多每 60 秒写一次。
 - **CSRF**：Cookie 认证的非幂等请求校验 `Origin` / `Sec-Fetch-Site`（同源放行，跨站 `403 csrf_rejected`）；Bearer 不受影响。
-- **限速**：按 `(IP, 用户名)` 计数，超过阈值锁定；失败写入审计。
+- **限速**：按 `(IP, 用户名)` 计数，并对 IP 做第二层限速（防用户名喷洒）；条目有上限并定期清理。
+- **用户管理**：管理员可创建/改角色/启停用/重置密码；停用与重置会吊销会话；**最后一个管理员不能被停用或降级**（409 `last_admin`）。
 - 认证顺序：Cookie 会话 → 共享 token → API Key；WS 额外保留票据（浏览器取票仍可用，但 Cookie 已足够）。
 
 ### 8.1c API Key（机器身份）

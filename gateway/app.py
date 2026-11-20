@@ -23,8 +23,9 @@ from starlette.websockets import WebSocketDisconnect
 from .access_log import AccessLogMiddleware, log_websocket
 from .audit import AuditTrail
 from .auth import (COOKIE_NAME, DUMMY_HASH, LoginLimiter, api_key_principal,
-                   hash_api_key, hash_token, legacy_principal, new_api_key,
-                   new_session_token, parse_api_key, session_principal, verify_password)
+                   hash_api_key, hash_password, hash_token, legacy_principal,
+                   new_api_key, new_session_token, parse_api_key, session_principal,
+                   validate_password, verify_password)
 from .config import Settings
 from .errors import GatewayError
 from .logging_setup import TRACE_ID, LogSettings
@@ -89,6 +90,26 @@ class ApiKeyCreate(InputModel):
     name: Text = Field(max_length=100)
     scopes: list[str] = Field(default_factory=list, max_length=10)
     expires_in_days: int | None = Field(default=None, ge=1, le=3650)
+
+
+class UserCreate(InputModel):
+    username: Text = Field(max_length=50)
+    password: Text = Field(max_length=200)
+    role: str = Field(default="member", pattern="^(admin|member|viewer)$")
+
+
+class UserUpdate(InputModel):
+    role: str | None = Field(default=None, pattern="^(admin|member|viewer)$")
+    status: str | None = Field(default=None, pattern="^(active|disabled)$")
+
+
+class PasswordReset(InputModel):
+    password: Text = Field(max_length=200)
+
+
+class PasswordChange(InputModel):
+    current_password: Text = Field(max_length=200)
+    new_password: Text = Field(max_length=200)
 
 
 def create_app(settings: Settings | None = None,
@@ -259,6 +280,21 @@ def create_app(settings: Settings | None = None,
         principal = getattr(request.state, "principal", None)
         if principal is None or principal["role"] != "admin":
             raise GatewayError(403, "forbidden", "需要管理员权限。")
+
+    def user_public(user: dict) -> dict:
+        return {key: user.get(key) for key in
+                ("id", "username", "role", "status", "created_at", "last_seen_at")}
+
+    async def ensure_not_last_admin(user: dict, *, role: str | None = None,
+                                     status: str | None = None) -> None:
+        if user["role"] != "admin" or user["status"] != "active":
+            return
+        final_role = role if role is not None else user["role"]
+        final_status = status if status is not None else user["status"]
+        if final_role == "admin" and final_status == "active":
+            return
+        if await run_in_threadpool(store.count_active_admins) <= 1:
+            raise GatewayError(409, "last_admin", "不能停用或降级最后一个管理员。")
 
     def owns(principal: dict, owner_id: str | None) -> bool:
         """admin 与管理级 API Key 可访问全部；其他人只能访问自己创建的资源。"""
@@ -613,6 +649,100 @@ def create_app(settings: Settings | None = None,
             raise GatewayError(404, "api_key_not_found", "API Key 不存在或已撤销。")
         await record_audit(request, "api_key.revoke", target_type="api_key",
                            target_id=key_id)
+
+    @app.get("/users", dependencies=auth)
+    async def list_users(request: Request):
+        require_admin(request)
+        users = await run_in_threadpool(store.list_users)
+        return [user_public(user) for user in users]
+
+    @app.post("/users", status_code=201, dependencies=auth)
+    async def create_user(data: UserCreate, request: Request):
+        require_admin(request)
+        if await run_in_threadpool(store.find_user, username=data.username):
+            raise GatewayError(409, "username_taken", "用户名已存在。")
+        try:
+            validate_password(data.password, data.username)
+        except ValueError as error:
+            raise GatewayError(422, "invalid_password", str(error)) from error
+        user = await run_in_threadpool(store.create_user, data.username,
+                                       hash_password(data.password), data.role)
+        await record_audit(request, "user.create", target_type="user", target_id=user["id"],
+                           details={"username": user["username"], "role": user["role"]})
+        return user_public(user)
+
+    @app.patch("/users/{user_id}", dependencies=auth)
+    async def update_user(user_id: str, data: UserUpdate, request: Request):
+        require_admin(request)
+        if data.role is None and data.status is None:
+            raise GatewayError(422, "invalid_request", "请至少提供一个要修改的字段。")
+        user = await run_in_threadpool(store.find_user, user_id=user_id)
+        if user is None:
+            raise GatewayError(404, "user_not_found", "用户不存在。")
+        await ensure_not_last_admin(user, role=data.role, status=data.status)
+        updated = await run_in_threadpool(store.update_user, user_id,
+                                          role=data.role, status=data.status)
+        if data.status == "disabled":
+            await run_in_threadpool(store.revoke_user_sessions, user_id)
+        await record_audit(request, "user.update", target_type="user", target_id=user_id,
+                           details={"fields": [key for key, value in
+                                               (("role", data.role), ("status", data.status))
+                                               if value is not None]})
+        return user_public(updated)
+
+    @app.post("/users/{user_id}/reset-password", dependencies=auth)
+    async def reset_password(user_id: str, data: PasswordReset, request: Request):
+        require_admin(request)
+        user = await run_in_threadpool(store.find_user, user_id=user_id)
+        if user is None:
+            raise GatewayError(404, "user_not_found", "用户不存在。")
+        try:
+            validate_password(data.password, user["username"])
+        except ValueError as error:
+            raise GatewayError(422, "invalid_password", str(error)) from error
+        await run_in_threadpool(store.update_user, user_id,
+                                password_hash=hash_password(data.password))
+        await run_in_threadpool(store.revoke_user_sessions, user_id)
+        await record_audit(request, "user.reset_password", target_type="user",
+                           target_id=user_id, details={"username": user["username"]})
+        return {"reset": True, "user_id": user_id}
+
+    @app.delete("/users/{user_id}/sessions", status_code=204, dependencies=auth)
+    async def revoke_user_sessions(user_id: str, request: Request):
+        require_admin(request)
+        user = await run_in_threadpool(store.find_user, user_id=user_id)
+        if user is None:
+            raise GatewayError(404, "user_not_found", "用户不存在。")
+        await run_in_threadpool(store.revoke_user_sessions, user_id)
+        await record_audit(request, "user.revoke_sessions", target_type="user",
+                           target_id=user_id)
+
+    @app.post("/auth/password", dependencies=auth)
+    async def change_password(data: PasswordChange, request: Request):
+        principal = request.state.principal
+        if principal["kind"] != "session":
+            raise GatewayError(403, "forbidden", "只有登录用户能修改自己的密码。")
+        user = await run_in_threadpool(store.find_user, user_id=principal["user_id"])
+        if user is None:
+            raise GatewayError(404, "user_not_found", "用户不存在。")
+        if not await run_in_threadpool(verify_password, data.current_password,
+                                       user["password_hash"]):
+            raise GatewayError(403, "invalid_password", "当前密码不正确。")
+        try:
+            validate_password(data.new_password, user["username"])
+        except ValueError as error:
+            raise GatewayError(422, "invalid_password", str(error)) from error
+        await run_in_threadpool(store.update_user, user["id"],
+                                password_hash=hash_password(data.new_password))
+        current = None
+        token = request.cookies.get(COOKIE_NAME)
+        if token:
+            row = await run_in_threadpool(store.find_auth_session, hash_token(token))
+            current = row["id"] if row else None
+        await run_in_threadpool(store.revoke_user_sessions, user["id"], except_id=current)
+        await record_audit(request, "auth.password_change", target_type="user",
+                           target_id=user["id"])
+        return {"changed": True}
 
     @app.post("/sessions/{session_id}/ticket", dependencies=auth)
     async def create_ticket(session_id: str, request: Request):

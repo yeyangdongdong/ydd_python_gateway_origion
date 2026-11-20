@@ -49,6 +49,18 @@ def verify_password(password: str, stored: str) -> bool:
 # 用户不存在时也算一次哈希，避免通过响应时间枚举用户名。
 DUMMY_HASH = hash_password("dummy-password-for-timing")
 
+WEAK_PASSWORDS = {"password123", "1234567890", "qwertyuiop", "admin12345", "1111111111"}
+
+
+def validate_password(password: str, username: str = "") -> None:
+    """所有入口（CLI/接口）共用；不满足时抛 ValueError，消息可直接展示。"""
+    if len(password) < 10:
+        raise ValueError("密码至少 10 位。")
+    if username and password.lower() == username.lower():
+        raise ValueError("密码不能与用户名相同。")
+    if password.lower() in WEAK_PASSWORDS:
+        raise ValueError("密码过于常见，请换一个。")
+
 
 def new_session_token() -> str:
     return secrets.token_urlsafe(32)
@@ -59,34 +71,63 @@ def hash_token(token: str) -> str:
 
 
 class LoginLimiter:
-    """按 (IP, 用户名) 统计失败次数并锁定；单进程内存即可。"""
+    """按 (IP, 用户名) 与 IP 两个维度限速；单进程内存即可。
 
-    def __init__(self, *, max_failures: int, window_seconds: int, lock_seconds: int) -> None:
+    - 账号维度：防止盯着一个用户名爆破；
+    - IP 维度：防止换用户名喷洒（对应用户名不存在也会计数）；
+    - 条目有上限并定期清理，避免被大量随机用户名撑大内存。
+    """
+
+    def __init__(self, *, max_failures: int, window_seconds: int, lock_seconds: int,
+                 ip_max_failures: int = 20, max_entries: int = 10000) -> None:
         self.max_failures = max_failures
         self.window_seconds = window_seconds
         self.lock_seconds = lock_seconds
+        self.ip_max_failures = ip_max_failures
+        self.max_entries = max_entries
         self.entries: dict[tuple[str, str], dict] = {}
+        self.ip_entries: dict[str, dict] = {}
 
-    def retry_after(self, ip: str, username: str) -> int:
-        entry = self.entries.get((ip, username))
-        if not entry:
-            return 0
-        now = time.monotonic()
-        if entry["locked_until"] > now:
+    def _prune(self, now: float) -> None:
+        if len(self.entries) + len(self.ip_entries) <= self.max_entries:
+            return
+        for table in (self.entries, self.ip_entries):
+            for key in list(table):
+                entry = table[key]
+                fresh = entry["locked_until"] > now or any(
+                    now - stamp < self.window_seconds for stamp in entry["failures"])
+                if not fresh:
+                    table.pop(key, None)
+
+    def _retry(self, entry: dict, now: float) -> int:
+        if entry and entry["locked_until"] > now:
             return int(entry["locked_until"] - now) + 1
-        entry["failures"] = [stamp for stamp in entry["failures"]
-                             if now - stamp < self.window_seconds]
         return 0
 
-    def record_failure(self, ip: str, username: str) -> None:
-        entry = self.entries.setdefault((ip, username), {"failures": [], "locked_until": 0.0})
+    def retry_after(self, ip: str, username: str) -> int:
         now = time.monotonic()
+        self._prune(now)
+        account = self._retry(self.entries.get((ip, username)), now)
+        if account:
+            return account
+        return self._retry(self.ip_entries.get(ip), now)
+
+    def _record(self, entry: dict, now: float, threshold: int) -> None:
         entry["failures"].append(now)
         entry["failures"] = [stamp for stamp in entry["failures"]
                              if now - stamp < self.window_seconds]
-        if len(entry["failures"]) >= self.max_failures:
+        if len(entry["failures"]) >= threshold:
             entry["locked_until"] = now + self.lock_seconds
             entry["failures"] = []
+
+    def record_failure(self, ip: str, username: str) -> None:
+        now = time.monotonic()
+        self._prune(now)
+        account = self.entries.setdefault((ip, username),
+                                          {"failures": [], "locked_until": 0.0})
+        self._record(account, now, self.max_failures)
+        source = self.ip_entries.setdefault(ip, {"failures": [], "locked_until": 0.0})
+        self._record(source, now, self.ip_max_failures)
 
     def record_success(self, ip: str, username: str) -> None:
         self.entries.pop((ip, username), None)

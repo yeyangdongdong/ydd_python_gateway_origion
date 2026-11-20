@@ -484,10 +484,22 @@ class Store:
             db.execute("UPDATE auth_sessions SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
                        (now(), session_id))
 
-    def revoke_user_sessions(self, user_id: str) -> None:
+    def revoke_user_sessions(self, user_id: str, *, except_id: str | None = None) -> None:
+        query = ("UPDATE auth_sessions SET revoked_at = ?"
+                 " WHERE user_id = ? AND revoked_at IS NULL")
+        parameters: list[object] = [now(), user_id]
+        if except_id:
+            query += " AND id != ?"
+            parameters.append(except_id)
         with self.connect() as db:
-            db.execute("UPDATE auth_sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL",
-                       (now(), user_id))
+            db.execute(query, parameters)
+
+    def count_active_admins(self) -> int:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT COUNT(*) FROM users WHERE role = 'admin' AND status = 'active'"
+            ).fetchone()
+        return int(row[0])
 
     # ------------------------------------------------------------ API Key
 

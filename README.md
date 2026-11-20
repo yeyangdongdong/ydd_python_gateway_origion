@@ -529,15 +529,24 @@ GATEWAY_AUTH_MODE=local
 GATEWAY_COOKIE_SECURE=false     # 走 HTTPS 时设为 true
 ```
 
-### 创建第一个管理员
+### 账号管理（CLI + 接口）
 
 ```powershell
+# 首次引导
 .\.venv\Scripts\python.exe -m gateway.admin create-user --username admin --admin
+
+# 日常运维
 .\.venv\Scripts\python.exe -m gateway.admin list-users
-.\.venv\Scripts\python.exe -m gateway.admin reset-password --username admin
+.\.venv\Scripts\python.exe -m gateway.admin create-user --username alice --role member
+.\.venv\Scripts\python.exe -m gateway.admin set-role --username alice --role viewer
+.\.venv\Scripts\python.exe -m gateway.admin disable-user --username alice
+.\.venv\Scripts\python.exe -m gateway.admin enable-user --username alice
+.\.venv\Scripts\python.exe -m gateway.admin reset-password --username alice
 ```
 
-密码用标准库 `scrypt` 加盐哈希（不落明文），至少 10 位；管理员之后可以创建 `member` / `viewer`。
+管理员也可以直接调用接口（见下方"认证相关接口"）；**不能停用或降级最后一个管理员**。
+密码策略对所有入口一致：至少 10 位、不能与用户名相同、拒绝常见弱口令；用标准库 `scrypt` 加盐哈希。
+停用用户、重置密码、用户自助改密都会吊销对应的登录会话。
 
 ### 登录与会话
 
@@ -596,6 +605,12 @@ $key.key   # 明文只返回这一次，请立即保存
 | GET | `/api-keys` | 列出 API Key（管理员） |
 | POST | `/api-keys` | 创建 API Key，返回一次性明文（管理员） |
 | DELETE | `/api-keys/{id}` | 撤销 API Key（管理员） |
+| GET | `/users` | 列出用户（管理员） |
+| POST | `/users` | 创建用户：`username`、`password`、`role`（管理员） |
+| PATCH | `/users/{id}` | 改角色/启停用（管理员；最后一个管理员受保护） |
+| POST | `/users/{id}/reset-password` | 重置密码并吊销该用户会话（管理员） |
+| DELETE | `/users/{id}/sessions` | 吊销该用户全部会话（管理员） |
+| POST | `/auth/password` | 登录用户修改自己的密码（保留当前会话） |
 
 ## 13. 部署：Caddy 前置 HTTPS（推荐）
 

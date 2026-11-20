@@ -42,23 +42,23 @@ Copy-Item .env.example .env
 | 顺序 | 文件 | 行数 | 读它是为了知道 |
 | --- | --- | --- | --- |
 | 1 | `run.py` | 37 | 入口、监听地址、日志初始化、对外监听保护 |
-| 2 | `gateway/app.py` | 780 | 路由、鉴权（token/会话/API Key/CSRF）、归属检查、错误映射；聊天/代理/审计如何接线 |
+| 2 | `gateway/app.py` | 920 | 路由、鉴权（token/会话/API Key/CSRF）、归属检查、用户管理、错误映射 |
 | 3 | `gateway/service.py` | 100 | 唯一的业务编排：排队 → 取历史 → 裁剪 → 调模型 → 落库 → 去重 |
 | 4 | `gateway/context.py` | 135 | token 估算与预算裁剪（纯函数，最容易改） |
 | 5 | `gateway/provider.py` | 122 | demo 回显与 SSE 解析、上游错误如何归一 |
-| 6 | `gateway/storage.py` | 545 | 迁移（审计/账号/API Key/归属）、表结构、事务边界、查询 |
+| 6 | `gateway/storage.py` | 554 | 迁移（审计/账号/API Key/归属）、表结构、事务边界、查询 |
 | 7 | `gateway/tickets.py` | 62 | 一次性票据（30 秒、单次、绑定资源） |
 | 8 | `gateway/access_log.py` | 198 | 访问日志中间件、参数摘要与脱敏 |
 | 9 | `gateway/logging_setup.py` | 303 | JSON 格式化、按类别/服务分文件、队列写盘、保留策略 |
 | 10 | `gateway/audit.py` | 83 | 审计双写（DB + 文件）与查询投影 |
-| 11 | `gateway/auth.py` | 132 | scrypt 密码、会话 token、登录限速、API Key、Principal |
-| 12 | `gateway/admin.py` | 84 | 命令行建用户 / 列用户 / 重置密码 |
+| 11 | `gateway/auth.py` | 173 | scrypt 密码、会话 token、登录限速、API Key、密码策略、Principal |
+| 12 | `gateway/admin.py` | 123 | 命令行建用户/改角色/启停用/重置密码 |
 | 13 | `gateway/proxy.py` | 487 | 反向代理：路由表校验、加权轮询与冷却、HTTP 流式转发、WS 桥接 |
 | 14 | `gateway/proxy_health.py` | 178 | 主动探活：周期探测、健康状态机、状态快照 |
 | 15 | `gateway/config.py` | 133 | 配置项与启动校验 |
 | 16 | `web/chat.html` / `web/login.html` | 330 / 约 100 | 聊天页与登录页（均无外部依赖） |
 
-合计约 3,400 行 Python（含注释与文档字符串）+ 约 430 行页面，不含测试。
+合计约 3,700 行 Python（含注释与文档字符串）+ 约 430 行页面，不含测试。
 行数会漂移，用它判断"该先读哪个"，不要当作精确指标。
 
 不熟悉的状态机、错误分层、并发模型，先看 [architecture.md](architecture.md)。
@@ -69,7 +69,7 @@ Copy-Item .env.example .env
 
 `tests/test_gateway.py`（约 1,080 行，55 个用例）覆盖业务链路，`tests/test_logging.py`（约 170 行，8 个用例）覆盖日志，
 `tests/test_audit.py`（约 100 行，5 个用例）覆盖审计，`tests/test_auth.py`（约 180 行，10 个用例）覆盖本地认证，
-`tests/test_api_keys.py`（约 140 行，5 个用例）覆盖 API Key，`tests/test_ownership.py`（约 130 行，5 个用例）覆盖归属与角色。原则是**从真实入口验证**：
+`tests/test_api_keys.py`（约 140 行，5 个用例）覆盖 API Key，`tests/test_ownership.py`（约 130 行，5 个用例）覆盖归属与角色，`tests/test_users.py`（约 140 行，7 个用例）覆盖用户管理、密码策略与登录限速。原则是**从真实入口验证**：
 
 - 用 `fastapi.testclient.TestClient` 走真实的 HTTP 与 WebSocket 路径，不直接调用 `ChatService`；
 - 模型服务用本地 `ThreadingHTTPServer` 替身（`ModelStub`），反向代理则用 `EchoStub`（HTTP）与
@@ -120,6 +120,7 @@ Copy-Item .env.example .env
 | 本地认证 | `test_hash_and_verify`、`test_login_logout_and_cookie_auth`、`test_wrong_password_is_audited_and_rate_limited`、`test_audit_failure_records_login`、`test_csrf_rejects_cross_site_mutation`、`test_revoked_and_expired_sessions_are_rejected`、`test_legacy_token_still_works_in_local_mode`、`test_websocket_accepts_session_cookie`、`test_next_redirect_is_restricted`、`test_login_page_is_disabled_in_legacy_mode` |
 | API Key | `test_create_list_and_audit`、`test_scope_limits_access`、`test_revoked_and_expired_keys_are_rejected`、`test_member_cannot_manage_keys`、`test_websocket_accepts_api_key` |
 | 归属与角色 | `test_members_only_see_their_own_sessions`、`test_agent_ownership_and_default_agent`、`test_viewer_is_read_only`、`test_websocket_rejects_other_members_session`、`test_proxy_required_scope` |
+| 用户管理与密码/限速 | `test_create_update_and_reset_password`、`test_last_admin_cannot_be_disabled`、`test_disabled_user_cannot_login_and_sessions_are_revoked`、`test_member_cannot_manage_users`、`test_self_password_change_revokes_other_sessions`、`test_password_policy_is_shared`、`test_ip_level_limiter_stops_username_spraying` |
 | demo 模式零依赖 | `test_default_demo_requires_no_model_service` |
 
 ### 3.4 写新用例时的四个坑
@@ -265,7 +266,7 @@ MIGRATIONS: list[tuple[int, tuple[str, ...]]] = [
 
 ## 6. 提交前检查清单
 
-- [ ] `python -m unittest discover -s tests` 全绿（当前 88 个）
+- [ ] `python -m unittest discover -s tests` 全绿（当前 97 个）
 - [ ] `python -m compileall -q gateway tests examples run.py` 通过
 - [ ] 改了接口/事件/错误码 → 同步 `docs/api.md`
 - [ ] 改了行为或配置 → 同步 `README.md` 与 `.env.example`

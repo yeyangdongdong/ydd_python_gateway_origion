@@ -66,7 +66,7 @@ WS_FORWARD_HEADERS = {"cookie", "origin", "user-agent"}
 
 # 内置路由占用的第一段路径，配到这里会导致内置接口被遮蔽，直接拒绝。
 RESERVED = {"sessions", "agents", "runs", "health", "docs", "redoc", "openapi.json",
-            "proxy-status", "audit", "login", "logout", "auth", "api-keys"}
+            "proxy-status", "audit", "login", "logout", "auth", "api-keys", "users"}
 
 # Starlette 允许应用主动发送的关闭码；上游的其他码（如 1006）必须映射。
 ALLOWED_CLOSE_CODES = {1000, 1001, 1002, 1003, *range(1007, 1015)}
