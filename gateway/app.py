@@ -29,6 +29,7 @@ from .auth import (COOKIE_NAME, DUMMY_HASH, LoginLimiter, api_key_principal,
 from .config import Settings
 from .errors import GatewayError
 from .logging_setup import TRACE_ID, LogSettings
+from .limits import BodyLimitMiddleware, SecurityHeadersMiddleware, UserLimiter, limiter_key
 from .net import forwarded_ip
 from .provider import ModelProvider
 from .proxy import Proxy, load_routes, match_route
@@ -121,6 +122,8 @@ def create_app(settings: Settings | None = None,
     login_limiter = LoginLimiter(max_failures=settings.login_max_failures,
                                  window_seconds=settings.login_window_seconds,
                                  lock_seconds=settings.login_lock_seconds)
+    chat_limiter = UserLimiter(concurrency=settings.chat_concurrency,
+                               per_minute=settings.chat_per_minute)
     # 启动时就把路由表读进内存：配置写错立刻报错，而不是等第一个请求。
     routes = load_routes(settings.routes_path)
 
@@ -153,9 +156,13 @@ def create_app(settings: Settings | None = None,
     app = FastAPI(title="ydd_python_gateway_origion", version="0.1.0",
                   description="易于理解的 Python Agent Gateway 基础版。", lifespan=lifespan)
 
+    # 中间件从内到外：BodyLimit → AccessLog（可选）→ SecurityHeaders。
+    app.add_middleware(BodyLimitMiddleware, max_bytes=settings.max_body_bytes,
+                       exempt_prefixes=tuple(route.prefix for route in routes))
     if log_settings is not None and log_settings.enabled:
         app.state.log_settings = log_settings
         app.add_middleware(AccessLogMiddleware, settings=log_settings)
+    app.add_middleware(SecurityHeadersMiddleware)
 
     def token_matches(authorization: str | None) -> bool:
         if not settings.gateway_token:
@@ -772,16 +779,18 @@ def create_app(settings: Settings | None = None,
     @app.post("/sessions/{session_id}/chat", dependencies=auth)
     async def chat(session_id: str, data: ChatInput, request: Request):
         await session_for(request, session_id)
-        async with aclosing(app.state.chat.stream(session_id, data.content, data.request_id)) as events:
-            async for event in events:
-                if event["type"] == "error":
-                    # 与其它 HTTP 错误保持同一形状：{"error": {code, message}}，
-                    # 会话/请求/运行编号放在外层，HTTP 状态码本身不用写进响应体。
-                    body = {key: value for key, value in event.items()
-                            if key not in {"type", "status"}}
-                    return JSONResponse(body, status_code=event["status"])
-                if event["type"] == "done":
-                    return event
+        async with chat_limiter.slot(limiter_key(request.state.principal)):
+            async with aclosing(app.state.chat.stream(
+                    session_id, data.content, data.request_id)) as events:
+                async for event in events:
+                    if event["type"] == "error":
+                        # 与其它 HTTP 错误保持同一形状：{"error": {code, message}}，
+                        # 会话/请求/运行编号放在外层，HTTP 状态码本身不用写进响应体。
+                        body = {key: value for key, value in event.items()
+                                if key not in {"type", "status"}}
+                        return JSONResponse(body, status_code=event["status"])
+                    if event["type"] == "done":
+                        return event
 
     @app.websocket("/sessions/{session_id}/stream")
     async def stream(websocket: WebSocket, session_id: str):
@@ -819,11 +828,12 @@ def create_app(settings: Settings | None = None,
                         422, "invalid_request", "请输入有效的 JSON，包含非空 content。")))
                     continue
                 try:
-                    async with aclosing(app.state.chat.stream(
-                        session_id, data.content, data.request_id
-                    )) as events:
-                        async for event in events:
-                            await websocket.send_json(event)
+                    async with chat_limiter.slot(limiter_key(principal)):
+                        async with aclosing(app.state.chat.stream(
+                            session_id, data.content, data.request_id
+                        )) as events:
+                            async for event in events:
+                                await websocket.send_json(event)
                 except GatewayError as error:
                     await websocket.send_json(ws_error(session_id, error,
                                                        request_id=data.request_id))

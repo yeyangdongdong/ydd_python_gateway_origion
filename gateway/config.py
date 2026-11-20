@@ -57,6 +57,11 @@ class Settings:
     login_max_failures: int = 5
     login_window_seconds: int = 300
     login_lock_seconds: int = 900
+    # 内置接口的请求体上限；代理前缀豁免（由代理路由自行控制）。
+    max_body_bytes: int = 1024 * 1024
+    # 每个用户的聊天并发与每分钟请求数。
+    chat_concurrency: int = 3
+    chat_per_minute: int = 60
 
     def __post_init__(self) -> None:
         if self.provider not in {"demo", "openai"}:
@@ -89,6 +94,11 @@ class Settings:
                             ("GATEWAY_LOGIN_LOCK_SECONDS", self.login_lock_seconds)):
             if value <= 0:
                 raise ValueError(f"{name} 必须是正整数。")
+        for name, value in (("GATEWAY_MAX_BODY_BYTES", self.max_body_bytes),
+                            ("GATEWAY_CHAT_CONCURRENCY", self.chat_concurrency),
+                            ("GATEWAY_CHAT_PER_MINUTE", self.chat_per_minute)):
+            if value <= 0:
+                raise ValueError(f"{name} 必须是正整数。")
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -110,6 +120,9 @@ class Settings:
             max_failures = int(os.getenv("GATEWAY_LOGIN_MAX_FAILURES", "5"))
             window = int(os.getenv("GATEWAY_LOGIN_WINDOW_SECONDS", "300"))
             lock = int(os.getenv("GATEWAY_LOGIN_LOCK_SECONDS", "900"))
+            max_body = int(os.getenv("GATEWAY_MAX_BODY_BYTES", str(1024 * 1024)))
+            chat_concurrency = int(os.getenv("GATEWAY_CHAT_CONCURRENCY", "3"))
+            chat_per_minute = int(os.getenv("GATEWAY_CHAT_PER_MINUTE", "60"))
         except ValueError as exc:
             raise ValueError("模型与登录相关的数值配置必须为整数/数字。") from exc
         return cls(
@@ -133,4 +146,7 @@ class Settings:
             login_max_failures=max_failures,
             login_window_seconds=window,
             login_lock_seconds=lock,
+            max_body_bytes=max_body,
+            chat_concurrency=chat_concurrency,
+            chat_per_minute=chat_per_minute,
         )

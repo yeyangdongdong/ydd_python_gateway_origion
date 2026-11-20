@@ -459,6 +459,9 @@ GATEWAY_TOKEN 为空        → 直接放行（不看票据）
 | 409 | `default_agent` | 试图删除默认助手 | 默认助手不可删 |
 | 409 | `interrupted` | 本轮因断连/停机中断（出现在运行记录里） | 换编号重试 |
 | 413 | `context_too_large` | 系统提示词 + 当前提问超出上下文预算 | 缩短输入或调大 `MODEL_CONTEXT_TOKENS` |
+| 413 | `body_too_large` | 请求体超过 `GATEWAY_MAX_BODY_BYTES`（代理前缀不适用） | 缩小请求体 |
+| 429 | `rate_limited` | 该用户每分钟聊天次数超限 | 降低频率或调大 `GATEWAY_CHAT_PER_MINUTE` |
+| 429 | `too_many_concurrent` | 该用户同时进行的聊天轮数超限 | 等上一轮结束或调大 `GATEWAY_CHAT_CONCURRENCY` |
 | 422 | `invalid_request` | 参数类型/长度/未知字段；`PATCH` 空请求体；分页参数越界 | 对照 `/docs` 修正 |
 | 500 | `internal_error` | 未预期的内部异常 | 查服务日志 |
 | 502 | `empty_reply` | 模型返回后拼接为空 | 检查模型 |

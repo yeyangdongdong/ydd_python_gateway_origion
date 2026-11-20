@@ -324,6 +324,9 @@ Agent、会话、消息和运行记录均保存在 SQLite。成功后，助手�
 | `GATEWAY_LOGIN_MAX_FAILURES` | `5` | 同 IP+账号连续失败多少次后锁定 |
 | `GATEWAY_LOGIN_WINDOW_SECONDS` | `300` | 失败计数窗口 |
 | `GATEWAY_LOGIN_LOCK_SECONDS` | `900` | 锁定时长 |
+| `GATEWAY_MAX_BODY_BYTES` | `1048576` | 内置接口请求体上限（代理前缀豁免） |
+| `GATEWAY_CHAT_CONCURRENCY` | `3` | 每个用户同时进行的聊天轮数上限 |
+| `GATEWAY_CHAT_PER_MINUTE` | `60` | 每个用户每分钟聊天请求上限 |
 
 `run.py` 默认只监听 `127.0.0.1:8000`。需要局域网访问时，先设置非空 `GATEWAY_TOKEN`，再运行 `python run.py --host 0.0.0.0`；跨不可信网络应通过 HTTPS/WSS 反向代理或受保护的隧道访问。不要把 `.env` 或数据库提交到代码仓库。
 
@@ -593,6 +596,12 @@ $key.key   # 明文只返回这一次，请立即保存
 - 升级前的历史会话 owner 为空 → 仅管理员可见；需要归属时用 SQL 手动回填；
 - `viewer` 的写请求统一返回 `403 forbidden`（`/logout` 除外）；
 - 代理路由可加 `required_scope`（例如 `"reports"`），API Key 必须带该 scope 或 `proxy` 才能访问。
+
+### 请求体与聊天限流
+
+- 内置接口的请求体默认上限 **1 MB**（`GATEWAY_MAX_BODY_BYTES`），超过返回 `413 body_too_large`；反向代理前缀豁免，由上游自行控制；
+- 每个用户同时最多 **3 轮**聊天、每分钟最多 **60 次**（`GATEWAY_CHAT_CONCURRENCY` / `GATEWAY_CHAT_PER_MINUTE`）；超限返回 `429 too_many_concurrent` / `429 rate_limited`；WS 的每一轮同样计数；
+- 所有响应带 `X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: same-origin`。
 
 ### 认证相关接口
 
