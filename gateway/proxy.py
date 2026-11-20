@@ -22,6 +22,8 @@
 """
 
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
 import time
@@ -60,6 +62,8 @@ LOOP_HEADER = "x-gateway-proxy"
 # 这些请求头不转发给上游：逐跳头、由 httpx 重算的 host/content-length、
 # 网关自己的 Bearer 凭据，以及回环标记（由本代理重新设置）。
 REQUEST_DROP = HOP_BY_HOP | {"host", "content-length", "authorization", LOOP_HEADER}
+IDENTITY_HEADERS = frozenset({"x-auth-user", "x-auth-roles",
+                              "x-auth-timestamp", "x-auth-signature"})
 
 # WS 握手时值得转发的头：Cookie 决定登录态，Origin 可能被上游用于来源校验。
 WS_FORWARD_HEADERS = {"cookie", "origin", "user-agent"}
@@ -99,6 +103,8 @@ class ProxyRoute:
     headers: dict[str, str] | None = None  # 额外注入给上游的请求头
     health: HealthSettings = HealthSettings()  # 主动探活参数（已合并全局默认）
     required_scope: str | None = None    # 配置后，API Key 必须带这个 scope
+    inject_identity: bool = False        # 是否向上游注入带签名的用户身份头
+    identity_secret: str | None = None   # 与上游共享的 HMAC 密钥
 
     def rewritten_path(self, remainder: str) -> str:
         """算出发给上游的路径：prefix 的取舍 + add_prefix。"""
@@ -209,6 +215,16 @@ def _parse_route(item: object, path: Path, default_health: HealthSettings) -> Pr
             raise ValueError(f"路由配置 {path} 里的 required_scope 必须是 1~50 字符的字符串。")
         required_scope = required_scope.strip()
 
+    inject_identity = item.get("inject_identity", False)
+    if not isinstance(inject_identity, bool):
+        raise ValueError(f"路由配置 {path} 里的 inject_identity 只能是 true 或 false。")
+    identity_secret = item.get("identity_secret")
+    if inject_identity and (not isinstance(identity_secret, str) or len(identity_secret) < 16):
+        raise ValueError(f"路由配置 {path} 启用 inject_identity 时，"
+                         "identity_secret 必须是至少 16 字符的共享密钥。")
+    if not inject_identity:
+        identity_secret = None
+
     # 路由级 health 覆盖全局：未写的字段沿用全局值，然后整体重新校验。
     raw_health = item.get("health")
     if raw_health is None:
@@ -221,7 +237,8 @@ def _parse_route(item: object, path: Path, default_health: HealthSettings) -> Pr
     return ProxyRoute(prefix=prefix, targets=tuple(targets), strip_prefix=strip_prefix,
                       add_prefix=add_prefix, methods=tuple(normalized), websocket=websocket,
                       cooldown_seconds=float(cooldown), headers=headers, health=health,
-                      required_scope=required_scope)
+                      required_scope=required_scope, inject_identity=inject_identity,
+                      identity_secret=identity_secret)
 
 
 def _parse_targets(item: dict, path: Path) -> list[Upstream]:
@@ -296,7 +313,8 @@ class Proxy:
         if request.headers.get(LOOP_HEADER):
             raise GatewayError(508, "proxy_loop", "检测到代理回环：上游又指回了网关自己。")
 
-        headers = self._request_headers(request.headers, route)
+        principal = getattr(request.state, "principal", None)
+        headers = self._request_headers(request.headers, route, principal)
         body = await request.body()
         # POST 之类的请求可能已经有副作用，连接失败也不换上游重放。
         retry_allowed = request.method in IDEMPOTENT_METHODS
@@ -342,7 +360,7 @@ class Proxy:
     # ----------------------------------------------------------- WebSocket
 
     async def forward_websocket(self, websocket: WebSocket, route: ProxyRoute,
-                                remainder: str) -> None:
+                                remainder: str, principal: dict | None = None) -> None:
         if websocket.headers.get(LOOP_HEADER):
             await websocket.send_json(_error_event(508, "proxy_loop",
                                                    "检测到代理回环：上游又指回了网关自己。"))
@@ -350,9 +368,11 @@ class Proxy:
             return
 
         headers = {key: value for key, value in websocket.headers.items()
-                   if key.lower() in WS_FORWARD_HEADERS}
+                   if key.lower() in WS_FORWARD_HEADERS
+                   and key.lower() not in IDENTITY_HEADERS}
         if route.headers:
             headers.update(route.headers)
+        headers.update(self._identity_headers(route, principal))
         subprotocols = list(websocket.scope.get("subprotocols") or [])
 
         connection = None
@@ -482,13 +502,31 @@ class Proxy:
     # ------------------------------------------------------------- helpers
 
     @staticmethod
-    def _request_headers(incoming, route: ProxyRoute) -> dict[str, str]:
+    def _request_headers(incoming, route: ProxyRoute, principal: dict | None = None) -> dict[str, str]:
+        # 先剥掉客户端自带的身份头，避免伪造；再按路由配置注入。
         headers = {key: value for key, value in incoming.items()
-                   if key.lower() not in REQUEST_DROP}
+                   if key.lower() not in REQUEST_DROP
+                   and key.lower() not in IDENTITY_HEADERS}
         if route.headers:
             headers.update(route.headers)
         headers[LOOP_HEADER] = "1"
+        headers.update(Proxy._identity_headers(route, principal))
         return headers
+
+    @staticmethod
+    def _identity_headers(route: ProxyRoute, principal: dict | None) -> dict[str, str]:
+        if not route.inject_identity or principal is None or not route.identity_secret:
+            return {}
+        user = principal.get("username") or ""
+        roles = principal.get("role") or ""
+        timestamp = str(int(time.time()))
+        signature = hmac.new(
+            route.identity_secret.encode("utf-8"),
+            f"{user}\n{roles}\n{timestamp}".encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        return {"X-Auth-User": user, "X-Auth-Roles": roles,
+                "X-Auth-Timestamp": timestamp, "X-Auth-Signature": signature}
 
     @staticmethod
     def _response_headers(incoming) -> dict[str, str]:

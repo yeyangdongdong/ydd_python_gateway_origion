@@ -456,6 +456,7 @@ new WebSocket(`ws://${location.host}/finance/live?ticket=${ticket}`);
 | 上游连不上 / 超时 | `502 upstream_unreachable` / `504 upstream_timeout` |
 | 前缀冲突 | 与 `/sessions`、`/agents`、`/runs`、`/health`、`/docs` 冲突的前缀在启动时直接拒绝 |
 | 权限 | 可写 `required_scope`：API Key 必须带该 scope（或 `proxy`）才能访问；登录用户按角色放行 |
+| 身份注入 | 路由配 `inject_identity: true` + `identity_secret`（≥16 字符）后，向上游注入 `X-Auth-User` / `X-Auth-Roles` / `X-Auth-Timestamp` / `X-Auth-Signature`（HMAC-SHA256）；客户端自带的同名头先被剥除 |
 | 文件不存在 | 不启用反向代理，对内置接口零影响 |
 
 `routes.json` 已被 `.gitignore` 忽略（每台机器的端口不同），模板 `routes.json.example` 会提交。Windows 上用记事本或 PowerShell 保存带 BOM 的文件也能正常读取。

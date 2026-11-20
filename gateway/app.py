@@ -908,7 +908,7 @@ def create_app(settings: Settings | None = None,
                     and route.required_scope not in principal["scopes"]:
                 await websocket.close(code=1008)
                 return
-            await websocket.app.state.proxy.forward_websocket(websocket, route, path)
+            await websocket.app.state.proxy.forward_websocket(websocket, route, path, principal)
         return forward
 
     for index, route in enumerate(routes):

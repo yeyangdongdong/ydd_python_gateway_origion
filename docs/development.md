@@ -59,7 +59,7 @@ Copy-Item .env.example .env
 | 16 | `gateway/limits.py` | 110 | 每用户并发/速率限制、请求体上限、安全响应头 |
 | 17 | `web/chat.html` / `web/login.html` | 330 / 约 100 | 聊天页与登录页（均无外部依赖） |
 
-合计约 3,800 行 Python（含注释与文档字符串）+ 约 430 行页面，不含测试。
+合计约 3,900 行 Python（含注释与文档字符串）+ 约 430 行页面，不含测试。
 行数会漂移，用它判断"该先读哪个"，不要当作精确指标。
 
 不熟悉的状态机、错误分层、并发模型，先看 [architecture.md](architecture.md)。
@@ -70,7 +70,7 @@ Copy-Item .env.example .env
 
 `tests/test_gateway.py`（约 1,080 行，55 个用例）覆盖业务链路，`tests/test_logging.py`（约 170 行，8 个用例）覆盖日志，
 `tests/test_audit.py`（约 100 行，5 个用例）覆盖审计，`tests/test_auth.py`（约 180 行，10 个用例）覆盖本地认证，
-`tests/test_api_keys.py`（约 140 行，5 个用例）覆盖 API Key，`tests/test_ownership.py`（约 130 行，5 个用例）覆盖归属与角色，`tests/test_users.py`（约 140 行，7 个用例）覆盖用户管理、密码策略与登录限速，`tests/test_limits.py`（约 80 行，5 个用例）覆盖限流与安全头。原则是**从真实入口验证**：
+`tests/test_api_keys.py`（约 140 行，5 个用例）覆盖 API Key，`tests/test_ownership.py`（约 130 行，5 个用例）覆盖归属与角色，`tests/test_users.py`（约 140 行，7 个用例）覆盖用户管理、密码策略与登录限速，`tests/test_limits.py`（约 80 行，5 个用例）覆盖限流与安全头，`tests/test_proxy_identity.py`（约 70 行，1 个用例）覆盖代理身份签名。原则是**从真实入口验证**：
 
 - 用 `fastapi.testclient.TestClient` 走真实的 HTTP 与 WebSocket 路径，不直接调用 `ChatService`；
 - 模型服务用本地 `ThreadingHTTPServer` 替身（`ModelStub`），反向代理则用 `EchoStub`（HTTP）与
@@ -123,6 +123,7 @@ Copy-Item .env.example .env
 | 归属与角色 | `test_members_only_see_their_own_sessions`、`test_agent_ownership_and_default_agent`、`test_viewer_is_read_only`、`test_websocket_rejects_other_members_session`、`test_proxy_required_scope` |
 | 用户管理与密码/限速 | `test_create_update_and_reset_password`、`test_last_admin_cannot_be_disabled`、`test_disabled_user_cannot_login_and_sessions_are_revoked`、`test_member_cannot_manage_users`、`test_self_password_change_revokes_other_sessions`、`test_password_policy_is_shared`、`test_ip_level_limiter_stops_username_spraying` |
 | 请求体/聊天限流/安全头 | `test_security_headers_are_added`、`test_body_limit_returns_413`、`test_chat_rate_limit_returns_429`、`test_concurrency_limit`、`test_per_minute_limit` |
+| 代理身份注入 | `test_signed_identity_and_spoof_stripping` |
 | demo 模式零依赖 | `test_default_demo_requires_no_model_service` |
 
 ### 3.4 写新用例时的四个坑
@@ -268,7 +269,7 @@ MIGRATIONS: list[tuple[int, tuple[str, ...]]] = [
 
 ## 6. 提交前检查清单
 
-- [ ] `python -m unittest discover -s tests` 全绿（当前 102 个）
+- [ ] `python -m unittest discover -s tests` 全绿（当前 103 个）
 - [ ] `python -m compileall -q gateway tests examples run.py` 通过
 - [ ] 改了接口/事件/错误码 → 同步 `docs/api.md`
 - [ ] 改了行为或配置 → 同步 `README.md` 与 `.env.example`
