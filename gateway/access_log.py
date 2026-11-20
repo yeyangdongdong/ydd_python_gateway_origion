@@ -14,6 +14,7 @@ from uuid import uuid4
 from starlette.datastructures import MutableHeaders
 
 from .logging_setup import TRACE_ID, LogSettings
+from .net import forwarded_ip
 
 SENSITIVE = re.compile(
     r"pass(word|wd)?|token|secret|api[_-]?key|authorization|cookie|ticket|credential",
@@ -133,8 +134,9 @@ class AccessLogMiddleware:
                 status = message["status"]
                 headers = MutableHeaders(scope=message)
                 headers["x-request-id"] = trace_id
+                upstream = headers.get("x-proxy-upstream", "")
                 self._emit(scope, status, started, trace_id,
-                           b"".join(chunks), truncated, received)
+                           b"".join(chunks), truncated, received, upstream)
                 logged = True
             await send(message)
 
@@ -149,26 +151,37 @@ class AccessLogMiddleware:
             TRACE_ID.reset(token)
 
     def _emit(self, scope, status: int, started: float, trace_id: str,
-              raw_body: bytes, truncated: bool, received: int) -> None:
+              raw_body: bytes, truncated: bool, received: int, upstream: str = "") -> None:
         method = scope.get("method", "")
         event = "http.request"
         fields = {
             "event": event,
-            "service": "gateway",
+            "service": scope.get("proxy_service") or "gateway",
             "http": {
                 "method": method,
                 "path": scope.get("path", ""),
                 "route": _route_path(scope),
                 "status": status,
                 "duration_ms": round((time.perf_counter() - started) * 1000, 1),
-                "client_ip": (scope.get("client") or ("", 0))[0],
+                "client_ip": forwarded_ip((scope.get("client") or ("", 0))[0],
+                                          _header(scope, "x-forwarded-for") or None,
+                                          _header(scope, "x-real-ip") or None),
                 "user_agent": _preview(_header(scope, "user-agent"), 200),
                 "bytes_in": received,
             },
             "params": self._params(scope, method, raw_body, truncated),
         }
+        if upstream:
+            fields["upstream"] = {"url": upstream}
         level = logging.WARNING if status >= 500 else logging.INFO
         self.logger.log(level, "http request", extra={"fields": fields})
+
+        # 被代理的服务额外写一份到 services/<name>/，便于按服务排查。
+        service = scope.get("proxy_service")
+        if service:
+            logging.getLogger(f"gateway.service.{service}").log(
+                level, "proxied request", extra={"fields": {**fields, "event": "service.request"}}
+            )
 
     def _params(self, scope, method: str, raw_body: bytes, truncated: bool) -> Any:
         if not self.settings.params:

@@ -28,6 +28,7 @@ from .auth import (COOKIE_NAME, DUMMY_HASH, LoginLimiter, api_key_principal,
 from .config import Settings
 from .errors import GatewayError
 from .logging_setup import TRACE_ID, LogSettings
+from .net import forwarded_ip
 from .provider import ModelProvider
 from .proxy import Proxy, load_routes, match_route
 from .service import ChatService
@@ -293,9 +294,15 @@ def create_app(settings: Settings | None = None,
             return legacy_principal()
         return None
 
+    def request_ip(request: Request) -> str:
+        # Caddy 前置时对端是 127.0.0.1，真实 IP 在 X-Forwarded-For；只信任回环对端。
+        peer = request.client.host if request.client else ""
+        return forwarded_ip(peer, request.headers.get("x-forwarded-for"),
+                            request.headers.get("x-real-ip"))
+
     def audit_context(request: Request) -> dict:
         principal = getattr(request.state, "principal", None)
-        ip = request.client.host if request.client else ""
+        ip = request_ip(request)
         if principal:
             return {"actor_type": principal["kind"],
                     "actor_id": principal["user_id"] or principal["username"],
@@ -363,7 +370,7 @@ def create_app(settings: Settings | None = None,
         next_path = (form.get("next") or ["/"])[0]
         if not next_path.startswith("/") or next_path.startswith("//"):
             next_path = "/"
-        ip = request.client.host if request.client else ""
+        ip = request_ip(request)
 
         retry_after = login_limiter.retry_after(ip, username)
         if retry_after:
@@ -734,6 +741,10 @@ def create_app(settings: Settings | None = None,
 
     # 可选的反向代理：按 routes.json 为每个前缀注册 HTTP 与 WebSocket 转发路由。
     # 放在最后注册，内置接口优先，不会被前缀遮蔽（加载时也已拒绝冲突前缀）。
+    def service_name(route) -> str:
+        raw = route.prefix.strip("/").split("/")[0]
+        return "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in raw) or "proxy"
+
     def make_forwarder(route):
         async def forward(request: Request, path: str) -> Response:
             principal = request.state.principal
@@ -741,6 +752,8 @@ def create_app(settings: Settings | None = None,
                 if "proxy" not in principal["scopes"] and \
                         route.required_scope not in principal["scopes"]:
                     raise GatewayError(403, "forbidden", "该 API Key 缺少代理权限。")
+            # 访问日志中间件据此额外写一份 services/<name>/。
+            request.scope["proxy_service"] = service_name(route)
             return await request.app.state.proxy.forward(request, route, path)
         return forward
 

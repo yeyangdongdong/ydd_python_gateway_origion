@@ -3,9 +3,11 @@
 import json
 import logging
 import tempfile
+import threading
 import unittest
 from dataclasses import replace
 from datetime import date, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -140,6 +142,59 @@ class RedactionTests(unittest.TestCase):
         self.assertEqual(cleaned["items"][0],
                          {"preview": "a" * 10, "length": 20, "truncated": True})
         self.assertEqual(cleaned["items"][1]["token"], "***")
+
+
+class _TinyUpstream(BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b'{"ok": true}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+class ServiceLogTests(unittest.TestCase):
+    def test_proxied_requests_are_written_to_service_directory(self):
+        with tempfile.TemporaryDirectory(prefix="ydd-service-log-") as tmp:
+            root = Path(tmp)
+            upstream = ThreadingHTTPServer(("127.0.0.1", 0), _TinyUpstream)
+            threading.Thread(target=upstream.serve_forever, daemon=True).start()
+            try:
+                routes = root / "routes.json"
+                routes.write_text(json.dumps({"routes": [{
+                    "prefix": "/demo/",
+                    "target": f"http://127.0.0.1:{upstream.server_address[1]}",
+                }]}), encoding="utf-8")
+                settings = Settings(provider="demo", model="demo",
+                                    db_path=root / "g.sqlite3", routes_path=routes)
+                log_settings = LogSettings(enabled=True, directory=root / "logs")
+                root_logger = logging.getLogger()
+                saved = root_logger.handlers[:]
+                saved_level = root_logger.level
+                runtime = setup_logging(log_settings)
+                try:
+                    with TestClient(create_app(settings, log_settings)) as client:
+                        response = client.get("/demo/hello")
+                        self.assertEqual(response.status_code, 200, response.text)
+                finally:
+                    runtime.stop()
+                    root_logger.handlers[:] = saved
+                    root_logger.setLevel(saved_level)
+            finally:
+                upstream.shutdown()
+                upstream.server_close()
+
+            files = list((root / "logs" / "services" / "demo").glob("*.log"))
+            self.assertEqual(len(files), 1)
+            entry = json.loads(files[0].read_text(encoding="utf-8").splitlines()[0])
+            self.assertEqual(entry["event"], "service.request")
+            self.assertEqual(entry["service"], "demo")
+            self.assertEqual(entry["http"]["path"], "/demo/hello")
+            self.assertIn("upstream", entry)
 
 
 class DailyHandlerTests(unittest.TestCase):

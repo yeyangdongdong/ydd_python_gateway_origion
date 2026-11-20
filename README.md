@@ -320,6 +320,7 @@ Agent、会话、消息和运行记录均保存在 SQLite。成功后，助手�
 | `GATEWAY_SESSION_IDLE_SECONDS` | `28800` | 会话空闲过期时间 |
 | `GATEWAY_SESSION_ABSOLUTE_SECONDS` | `604800` | 会话绝对过期时间 |
 | `GATEWAY_COOKIE_SECURE` | `false` | 走 HTTPS 时设为 `true`（Cookie 加 `Secure`） |
+| `GATEWAY_ALLOW_INSECURE_LAN` | `false` | 临时允许非回环地址明文 HTTP；正式部署请用 Caddy 前置 |
 | `GATEWAY_LOGIN_MAX_FAILURES` | `5` | 同 IP+账号连续失败多少次后锁定 |
 | `GATEWAY_LOGIN_WINDOW_SECONDS` | `300` | 失败计数窗口 |
 | `GATEWAY_LOGIN_LOCK_SECONDS` | `900` | 锁定时长 |
@@ -596,7 +597,40 @@ $key.key   # 明文只返回这一次，请立即保存
 | POST | `/api-keys` | 创建 API Key，返回一次性明文（管理员） |
 | DELETE | `/api-keys/{id}` | 撤销 API Key（管理员） |
 
-## 13. 基础版范围
+## 13. 部署：Caddy 前置 HTTPS（推荐）
+
+局域网多人使用时，**不要**让网关直接监听 `0.0.0.0` 明文跑：
+
+```text
+浏览器/客户端 → Caddy (HTTPS, 内网 CA) → 127.0.0.1:8000 (Gateway)
+```
+
+1. 网关保持默认监听 `127.0.0.1`，并设置：
+
+   ```dotenv
+   GATEWAY_AUTH_MODE=local
+   GATEWAY_COOKIE_SECURE=true
+   ```
+
+2. 安装 Caddy，把 [deploy/Caddyfile.example](deploy/Caddyfile.example) 复制为 `Caddyfile`，改域名后运行：
+
+   ```powershell
+   caddy run --config Caddyfile
+   ```
+
+3. 局域网客户端信任一次 Caddy 内部根证书：
+   `%LOCALAPPDATA%\Caddy\pki\authorities\local\root.crt`。
+
+4. 访问 `https://gateway.example.internal/login`。
+
+说明：
+
+- 网关只信任**回环对端**的 `X-Forwarded-For` / `X-Real-IP`，因此日志和登录限速拿到的是真实客户端 IP；
+- 如果 Caddy 不在本机，需自行扩展信任列表（当前实现刻意只信任回环，防止伪造头）；
+- 直接监听非回环地址且未开 `GATEWAY_COOKIE_SECURE` 时，`run.py` 会拒绝启动；临时调试可显式设置 `GATEWAY_ALLOW_INSECURE_LAN=true`；
+- 反向代理的 `X-Forwarded-For` 也会被转发给上游（逐跳头除外），上游可据此记录真实来源。
+
+## 14. 基础版范围
 
 这是独立的简化 Gateway，借鉴 OpenClaw 的职责划分，使用自己的 API。它不能直接替换 OpenClaw Gateway，也不兼容现有 OpenClaw Control UI、CLI、配对和 RPC 协议。
 

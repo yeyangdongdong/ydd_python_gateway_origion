@@ -21,9 +21,13 @@ def main() -> None:
         app = create_app(settings, log_settings)
     except ValueError as error:
         parser.error(str(error))
-    if args.host not in {"127.0.0.1", "localhost", "::1"} \
-            and not settings.gateway_token and settings.auth_mode != "local":
-        parser.error("对外监听前请启用本地认证（GATEWAY_AUTH_MODE=local）或设置 GATEWAY_TOKEN。")
+    if args.host not in {"127.0.0.1", "localhost", "::1"}:
+        if settings.auth_mode == "local" and not settings.cookie_secure \
+                and not settings.allow_insecure_lan:
+            parser.error("非回环地址上的本地认证需要 HTTPS：请用 Caddy 前置并只监听 127.0.0.1；"
+                         "临时调试可显式设置 GATEWAY_ALLOW_INSECURE_LAN=true。")
+        if not settings.gateway_token and settings.auth_mode != "local":
+            parser.error("对外监听前请启用本地认证（GATEWAY_AUTH_MODE=local）或设置 GATEWAY_TOKEN。")
     runtime = setup_logging(log_settings)
     try:
         # log_config=None：日志格式与去向完全由我们接管（含 access 日志的脱敏）。

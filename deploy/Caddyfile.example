@@ -1,0 +1,17 @@
+# Caddy 前置：对局域网提供 HTTPS，再把请求转给只监听 127.0.0.1 的网关。
+#
+# 使用：
+#   1. 把 gateway.example.internal 换成内网 DNS 名称或服务器 IP；
+#   2. caddy run --config Caddyfile
+#   3. 第一次启动会用内部 CA 签发证书，客户端需信任一次 Caddy 根证书
+#      （%LOCALAPPDATA%\Caddy\pki\authorities\local\root.crt）。
+#
+# 网关侧保持默认监听 127.0.0.1:8000，并设置 GATEWAY_COOKIE_SECURE=true。
+
+gateway.example.internal {
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:8000 {
+		header_up X-Real-IP {remote_host}
+	}
+	tls internal
+}

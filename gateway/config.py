@@ -52,6 +52,8 @@ class Settings:
     session_idle_seconds: int = 8 * 3600
     session_absolute_seconds: int = 7 * 24 * 3600
     cookie_secure: bool = False
+    # 允许在非回环地址上以明文 HTTP 使用本地认证（不推荐，仅用于临时内网调试）。
+    allow_insecure_lan: bool = False
     login_max_failures: int = 5
     login_window_seconds: int = 300
     login_lock_seconds: int = 900
@@ -127,6 +129,7 @@ class Settings:
             session_idle_seconds=idle,
             session_absolute_seconds=absolute,
             cookie_secure=read_flag("GATEWAY_COOKIE_SECURE", False),
+            allow_insecure_lan=read_flag("GATEWAY_ALLOW_INSECURE_LAN", False),
             login_max_failures=max_failures,
             login_window_seconds=window,
             login_lock_seconds=lock,
