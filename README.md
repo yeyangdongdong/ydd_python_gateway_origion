@@ -451,6 +451,7 @@ new WebSocket(`ws://${location.host}/finance/live?ticket=${ticket}`);
 | 超时 | `GATEWAY_PROXY_TIMEOUT`，默认 30 秒，独立于模型超时；读超时不重试也不冷却 |
 | 上游连不上 / 超时 | `502 upstream_unreachable` / `504 upstream_timeout` |
 | 前缀冲突 | 与 `/sessions`、`/agents`、`/runs`、`/health`、`/docs` 冲突的前缀在启动时直接拒绝 |
+| 权限 | 可写 `required_scope`：API Key 必须带该 scope（或 `proxy`）才能访问；登录用户按角色放行 |
 | 文件不存在 | 不启用反向代理，对内置接口零影响 |
 
 `routes.json` 已被 `.gitignore` 忽略（每台机器的端口不同），模板 `routes.json.example` 会提交。Windows 上用记事本或 PowerShell 保存带 BOM 的文件也能正常读取。
@@ -568,6 +569,20 @@ $key.key   # 明文只返回这一次，请立即保存
 - 可设过期时间、可随时撤销（`DELETE /api-keys/{id}`）；`last_used_at` 最多每分钟更新一次；
 - API Key **不能**管理 API Key，也不能读 `/audit`（除非同时给了 `audit` scope）；
 - 请求方式：`Authorization: Bearer ydd_...`。
+
+### 角色与资源归属
+
+| 角色 | 会话/消息 | Agent | 用户/API Key | 审计 | 代理前缀 |
+| --- | --- | --- | --- | --- | --- |
+| `admin` | 全部 | 全部 | 管理 | 查看 | 全部 |
+| `member` | 仅自己创建 | 自己创建的 + 默认助手 | 否 | 否 | 全部（按前缀） |
+| `viewer` | 仅自己（只读） | 只读 | 否 | 否 | 只读方法 |
+
+- `sessions.owner_id` / `agents.owner_id` 记录归属；访问别人的会话一律返回 **404**（不暴露是否存在）；
+- **默认助手**（owner 为空）对所有登录用户可用，但只有管理员能修改/删除；
+- 升级前的历史会话 owner 为空 → 仅管理员可见；需要归属时用 SQL 手动回填；
+- `viewer` 的写请求统一返回 `403 forbidden`（`/logout` 除外）；
+- 代理路由可加 `required_scope`（例如 `"reports"`），API Key 必须带该 scope 或 `proxy` 才能访问。
 
 ### 认证相关接口
 

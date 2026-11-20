@@ -133,6 +133,12 @@ MIGRATIONS: list[tuple[int, tuple[str, ...]]] = [
         """,
         "CREATE INDEX IF NOT EXISTS api_keys_owner ON api_keys(owner_id)",
     )),
+    (5, (
+        "ALTER TABLE sessions ADD COLUMN owner_id TEXT",
+        "ALTER TABLE agents ADD COLUMN owner_id TEXT",
+        "CREATE INDEX IF NOT EXISTS sessions_owner ON sessions(owner_id)",
+        "CREATE INDEX IF NOT EXISTS agents_owner ON agents(owner_id)",
+    )),
 ]
 
 
@@ -184,23 +190,42 @@ class Store:
                     finished_at = ? WHERE status = 'running'
             """, (now(),))
             db.execute("""
-                INSERT OR IGNORE INTO agents VALUES ('default', ?, ?, ?, ?)
+                INSERT OR IGNORE INTO agents (id, name, system_prompt, model, created_at)
+                VALUES ('default', ?, ?, ?, ?)
             """, ("默认助手", "你是一个友好、准确的中文助手。", default_model, now()))
             # 默认 Agent 跟随环境中的模型；用户创建的 Agent 保留各自配置。
             db.execute("UPDATE agents SET model = ? WHERE id = 'default'", (default_model,))
 
-    def list_agents(self, limit: int = 100, offset: int = 0) -> list[dict]:
+    def list_agents(self, limit: int = 100, offset: int = 0,
+                    owner_id: str | None = None) -> list[dict]:
+        query = "SELECT * FROM agents"
+        parameters: list[object] = []
+        if owner_id:
+            # 默认助手（owner 为空）对所有人可见，其余只看自己的。
+            query += " WHERE owner_id IS NULL OR owner_id = ?"
+            parameters.append(owner_id)
+        query += " ORDER BY created_at, id LIMIT ? OFFSET ?"
+        parameters += [limit, offset]
         with self.connect() as db:
-            rows = db.execute(
-                "SELECT * FROM agents ORDER BY created_at, id LIMIT ? OFFSET ?", (limit, offset)
-            ).fetchall()
+            rows = db.execute(query, parameters).fetchall()
         return [dict(row) for row in rows]
 
-    def create_agent(self, name: str, system_prompt: str, model: str) -> dict:
-        agent = dict(id=uuid4().hex, name=name, system_prompt=system_prompt,
-                     model=model, created_at=now())
+    def get_agent(self, agent_id: str) -> dict:
         with self.connect() as db:
-            db.execute("INSERT INTO agents VALUES (:id, :name, :system_prompt, :model, :created_at)", agent)
+            row = self._row(db, "SELECT * FROM agents WHERE id = ?", agent_id)
+        if row is None:
+            raise GatewayError(404, "agent_not_found", "Agent 不存在。")
+        return dict(row)
+
+    def create_agent(self, name: str, system_prompt: str, model: str,
+                     owner_id: str | None = None) -> dict:
+        agent = dict(id=uuid4().hex, name=name, system_prompt=system_prompt,
+                     model=model, created_at=now(), owner_id=owner_id)
+        with self.connect() as db:
+            db.execute("""
+                INSERT INTO agents (id, name, system_prompt, model, created_at, owner_id)
+                VALUES (:id, :name, :system_prompt, :model, :created_at, :owner_id)
+            """, agent)
         return agent
 
     def update_agent(self, agent_id: str, *, name: str | None = None,
@@ -230,19 +255,30 @@ class Store:
                 raise GatewayError(409, "agent_in_use", "该 Agent 仍有会话，请先删除这些会话。")
             db.execute("DELETE FROM agents WHERE id = ?", (agent_id,))
 
-    def create_session(self, agent_id: str, title: str) -> dict:
-        session = dict(id=uuid4().hex, agent_id=agent_id, title=title, created_at=now())
+    def create_session(self, agent_id: str, title: str,
+                       owner_id: str | None = None) -> dict:
+        session = dict(id=uuid4().hex, agent_id=agent_id, title=title,
+                       created_at=now(), owner_id=owner_id)
         with self.connect() as db:
             if not db.execute("SELECT 1 FROM agents WHERE id = ?", (agent_id,)).fetchone():
                 raise GatewayError(404, "agent_not_found", "Agent 不存在，请先创建 Agent。")
-            db.execute("INSERT INTO sessions VALUES (:id, :agent_id, :title, :created_at)", session)
+            db.execute("""
+                INSERT INTO sessions (id, agent_id, title, created_at, owner_id)
+                VALUES (:id, :agent_id, :title, :created_at, :owner_id)
+            """, session)
         return session
 
-    def list_sessions(self, limit: int = 100, offset: int = 0) -> list[dict]:
+    def list_sessions(self, limit: int = 100, offset: int = 0,
+                      owner_id: str | None = None) -> list[dict]:
+        query = "SELECT * FROM sessions"
+        parameters: list[object] = []
+        if owner_id:
+            query += " WHERE owner_id = ?"
+            parameters.append(owner_id)
+        query += " ORDER BY created_at, id LIMIT ? OFFSET ?"
+        parameters += [limit, offset]
         with self.connect() as db:
-            rows = db.execute(
-                "SELECT * FROM sessions ORDER BY created_at, id LIMIT ? OFFSET ?", (limit, offset)
-            ).fetchall()
+            rows = db.execute(query, parameters).fetchall()
         return [dict(row) for row in rows]
 
     def update_session(self, session_id: str, *, title: str) -> dict:

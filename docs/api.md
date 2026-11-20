@@ -335,6 +335,8 @@ WS    /finance/live         →  ws://127.0.0.1:9001/live
 | 探活 | 顶层 `health` 或路由级 `health` 开启后，主动探测并摘除不健康上游；状态见 `GET /proxy-status` |
 | 失败切换 | 只有幂等方法（GET/HEAD/OPTIONS）在连接失败时换下一个上游；POST 等不重放；响应开始后不重试 |
 | 鉴权 | 与其他业务接口相同：设置了 `GATEWAY_TOKEN` 就必须带 `Authorization`；代理 WS 还可用 `/proxy-ticket` 换的票据 |
+| 权限 | 路由可配 `required_scope`：API Key 必须带该 scope（或 `proxy`）才能访问；登录用户按角色放行 |
+| 归属 | 会话与 Agent 按 `owner_id` 隔离；访问别人的资源返回 404；`viewer` 只读 |
 | 转发内容 | 方法、路径、查询串、请求体、状态码、响应头；上游的 4xx/5xx 原样返回 |
 | 路径改写 | `strip_prefix`（默认去前缀）+ `add_prefix`（默认空，可再加一层） |
 | 方法限制 | `methods` 只开放指定方法，其余返回 405 |

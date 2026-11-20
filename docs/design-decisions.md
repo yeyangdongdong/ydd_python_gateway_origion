@@ -405,13 +405,33 @@ Key 不能管理 Key；管理员可撤销；`last_used_at` 最多每分钟更新
 
 ---
 
+## ADR-018 资源归属用 `owner_id`，越权返回 404
+
+**背景**：多人使用后必须隔离会话与 Agent；否则任何账号都能读别人的对话（IDOR）。
+
+**决定**
+
+- `sessions.owner_id` / `agents.owner_id`（可空）；默认助手为空表示共享；
+- 查询列表按 owner 过滤，单资源访问命中不了 owner 就当作 **404**；
+- `viewer` 在读路径上放行、写路径统一 403（`/logout` 例外）；
+- 历史数据 owner 为空 → 仅管理员可见，需要时手动回填；
+- API Key 是服务身份，不参与用户归属，只受 scope 限制。
+
+**后果**
+
+- 用 404 而不是 403，避免攻击者枚举"哪些会话属于别人"。
+- 所有会话级接口（含 WS、票据、运行查询）都要经过同一个 `ensure_session_access`，漏一处就是漏洞，因此测试覆盖了 HTTP 与 WS 两条路径。
+- 没有"共享给某个用户"的能力；需要时再加 `session_members` 表，而不是把 owner 改空。
+
+---
+
 ## 待定决策（已知但尚未做）
 
 | 主题 | 现状 | 若要做，建议 |
 | --- | --- | --- |
 | 历史摘要压缩 | 只丢不压 | 在裁剪点调模型生成摘要，存进 sessions 表，作为一条 system 消息 |
 | OpenAI 入站兼容 | 无 | 新增 `POST /v1/chat/completions`，用 `model` 映射到 Agent，复用 `ChatService` |
-| 多用户 | 单 token | 引入 token 表 + 每 token 可见的 Agent/Session；票据也需绑定用户（见 docs/proposals） |
+| 多用户隔离 | 已实现（v5 owner_id + 角色） | 需要共享时增加 `session_members` 表，而非放宽 owner |
 | 迁移回滚 | 只进不退 | 每个版本配一条 down 脚本，或发布前备份数据库 |
 | 代理粘性 | 无 | 按 cookie/IP 做一致性哈希；上游有本地状态时才需要（见 docs/proposals） |
 | 浏览器 Cookie 登录 | 每页自己取票 | 登录页 + 签名 Cookie + CSRF 校验（见 docs/proposals） |

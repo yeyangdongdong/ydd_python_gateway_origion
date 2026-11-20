@@ -324,8 +324,8 @@ async with lock:
 
 ```sql
 schema_version(version INTEGER)   -- 只有一行，记录已执行到的迁移版本
-agents(id TEXT PK, name, system_prompt, model, created_at)
-sessions(id TEXT PK, agent_id → agents.id, title, created_at)
+agents(id TEXT PK, name, system_prompt, model, created_at, owner_id)   -- v5
+sessions(id TEXT PK, agent_id → agents.id, title, created_at, owner_id) -- v5
 runs(id TEXT PK, session_id → sessions.id, request_id, input, status, reply,
      error_code, error_message, created_at, finished_at,
      UNIQUE(session_id, request_id))
@@ -338,7 +338,7 @@ CREATE INDEX audit_log_ts ON audit_log(ts)
 CREATE INDEX audit_log_action ON audit_log(action, ts)
 ```
 
-迁移版本：v1 是初始表结构，v2 增加 `audit_log`。追加写法见 [development.md](development.md#45-新增表或字段)。
+迁移版本：v1 初始表结构；v2 `audit_log`；v3 用户与会话；v4 API Key；v5 资源归属列 `owner_id`。
 
 - 状态约束：`runs.status IN ('running','completed','failed','interrupted')`。
 - `UNIQUE(session_id, request_id)` 是"去重"在数据库层的最后一道保障。
@@ -467,6 +467,20 @@ remaining   = budget − fixed − notice
 - API Key 不能管理 API Key，也不能默认读审计；
 - `last_used_at` 最多每 60 秒更新一次，避免每个请求一个写事务；
 - 管理员可随时撤销；数据库泄露不会直接得到可用的 Key（只有哈希）。
+
+### 8.1d 角色与资源归属
+
+| 角色 | 读 | 写 | 管理 |
+| --- | --- | --- | --- |
+| `admin` | 全部 | 全部 | 用户/API Key、审计、代理状态 |
+| `member` | 自己创建的会话/Agent + 默认助手 | 仅自己的资源 | 否 |
+| `viewer` | 同 member | 不允许（403） | 否 |
+| `api_key` | 由 scope 决定 | 由 scope 决定 | 否 |
+
+- 归属存在 `sessions.owner_id` / `agents.owner_id`；越权访问统一返回 **404**，不泄露资源是否存在；
+- 默认助手 owner 为空，所有人可用，但仅管理员可改/删；
+- API Key 是服务身份，不参与用户归属，只受 scope 限制；
+- `required_scope` 允许给单个代理前缀追加权限（例如 `"reports"`），比全局 `proxy` 更细。
 
 ### 8.2 票据生命周期
 

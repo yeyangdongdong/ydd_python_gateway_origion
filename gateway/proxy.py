@@ -98,6 +98,7 @@ class ProxyRoute:
     cooldown_seconds: float = 5.0    # 连接失败后的冷却时间
     headers: dict[str, str] | None = None  # 额外注入给上游的请求头
     health: HealthSettings = HealthSettings()  # 主动探活参数（已合并全局默认）
+    required_scope: str | None = None    # 配置后，API Key 必须带这个 scope
 
     def rewritten_path(self, remainder: str) -> str:
         """算出发给上游的路径：prefix 的取舍 + add_prefix。"""
@@ -201,6 +202,13 @@ def _parse_route(item: object, path: Path, default_health: HealthSettings) -> Pr
     ):
         raise ValueError(f"路由配置 {path} 里的 headers 必须是字符串键值对。")
 
+    required_scope = item.get("required_scope")
+    if required_scope is not None:
+        if not isinstance(required_scope, str) or not required_scope.strip() \
+                or len(required_scope) > 50:
+            raise ValueError(f"路由配置 {path} 里的 required_scope 必须是 1~50 字符的字符串。")
+        required_scope = required_scope.strip()
+
     # 路由级 health 覆盖全局：未写的字段沿用全局值，然后整体重新校验。
     raw_health = item.get("health")
     if raw_health is None:
@@ -212,7 +220,8 @@ def _parse_route(item: object, path: Path, default_health: HealthSettings) -> Pr
 
     return ProxyRoute(prefix=prefix, targets=tuple(targets), strip_prefix=strip_prefix,
                       add_prefix=add_prefix, methods=tuple(normalized), websocket=websocket,
-                      cooldown_seconds=float(cooldown), headers=headers, health=health)
+                      cooldown_seconds=float(cooldown), headers=headers, health=health,
+                      required_scope=required_scope)
 
 
 def _parse_targets(item: dict, path: Path) -> list[Upstream]:

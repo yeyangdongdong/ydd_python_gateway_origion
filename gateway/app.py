@@ -238,6 +238,9 @@ def create_app(settings: Settings | None = None,
         request.state.principal = principal
         if principal["kind"] == "api_key":
             enforce_scope(request, principal)
+        if principal["role"] == "viewer" and request.method not in SAFE_METHODS \
+                and request.url.path != "/logout":
+            raise GatewayError(403, "forbidden", "只读账号不能执行写操作。")
 
     def enforce_scope(request: Request, principal: dict) -> None:
         """API Key 按资源级别授权；会话/Agent/审计各自需要对应 scope。"""
@@ -255,6 +258,22 @@ def create_app(settings: Settings | None = None,
         principal = getattr(request.state, "principal", None)
         if principal is None or principal["role"] != "admin":
             raise GatewayError(403, "forbidden", "需要管理员权限。")
+
+    def owns(principal: dict, owner_id: str | None) -> bool:
+        """admin 与管理级 API Key 可访问全部；其他人只能访问自己创建的资源。"""
+        if principal["role"] == "admin" or principal["kind"] == "api_key":
+            return True
+        return bool(owner_id) and owner_id == principal["user_id"]
+
+    def ensure_session_access(principal: dict, session: dict) -> None:
+        # 用 404 而不是 403，避免暴露"别人的会话是否存在"。
+        if not owns(principal, session.get("owner_id")):
+            raise GatewayError(404, "session_not_found", "会话不存在。")
+
+    async def session_for(request: Request, session_id: str) -> dict:
+        session = await run_in_threadpool(store.get_session, session_id)
+        ensure_session_access(request.state.principal, session)
+        return session
 
     auth = [Depends(require_auth)]
 
@@ -411,22 +430,29 @@ def create_app(settings: Settings | None = None,
                     "role": principal["role"]}}
 
     @app.get("/proxy-status", dependencies=auth)
-    async def proxy_status():
+    async def proxy_status(request: Request):
         """反向代理的只读状态：每个上游是否健康、是否在冷却、最近一次错误。"""
+        require_admin(request)
         proxy = app.state.proxy
         if proxy is None:
             return {"enabled": False, "routes": []}
         return {"enabled": True, **proxy.status()}
 
     @app.get("/agents", dependencies=auth)
-    async def list_agents(limit: int = Query(default=AGENT_PAGE, ge=1, le=1000),
+    async def list_agents(request: Request,
+                          limit: int = Query(default=AGENT_PAGE, ge=1, le=1000),
                           offset: int = Query(default=0, ge=0)):
-        return await run_in_threadpool(store.list_agents, limit, offset)
+        principal = request.state.principal
+        owner = None if principal["role"] == "admin" or principal["kind"] == "api_key" \
+            else principal["user_id"]
+        return await run_in_threadpool(store.list_agents, limit, offset, owner)
 
     @app.post("/agents", status_code=201, dependencies=auth)
     async def create_agent(data: AgentCreate, request: Request):
+        principal = request.state.principal
         agent = await run_in_threadpool(store.create_agent, data.name, data.system_prompt,
-                                        data.model or settings.model)
+                                        data.model or settings.model,
+                                        principal["user_id"] or None)
         await record_audit(request, "agent.create", target_type="agent",
                            target_id=agent["id"],
                            details={"name": agent["name"], "model": agent["model"]})
@@ -436,6 +462,10 @@ def create_app(settings: Settings | None = None,
     async def update_agent(agent_id: str, data: AgentUpdate, request: Request):
         if data.name is None and data.system_prompt is None and data.model is None:
             raise GatewayError(422, "invalid_request", "请至少提供一个要修改的字段。")
+        principal = request.state.principal
+        existing = await run_in_threadpool(store.get_agent, agent_id)
+        if not owns(principal, existing.get("owner_id")):
+            raise GatewayError(404, "agent_not_found", "Agent 不存在。")
         agent = await run_in_threadpool(store.update_agent, agent_id, name=data.name,
                                         system_prompt=data.system_prompt, model=data.model)
         changed = [field for field in ("name", "system_prompt", "model")
@@ -446,24 +476,38 @@ def create_app(settings: Settings | None = None,
 
     @app.delete("/agents/{agent_id}", status_code=204, dependencies=auth)
     async def delete_agent(agent_id: str, request: Request):
+        principal = request.state.principal
+        existing = await run_in_threadpool(store.get_agent, agent_id)
+        if not owns(principal, existing.get("owner_id")):
+            raise GatewayError(404, "agent_not_found", "Agent 不存在。")
         await run_in_threadpool(store.delete_agent, agent_id)
         await record_audit(request, "agent.delete", target_type="agent", target_id=agent_id)
 
     @app.get("/sessions", dependencies=auth)
-    async def list_sessions(limit: int = Query(default=SESSION_PAGE, ge=1, le=1000),
+    async def list_sessions(request: Request,
+                            limit: int = Query(default=SESSION_PAGE, ge=1, le=1000),
                             offset: int = Query(default=0, ge=0)):
-        return await run_in_threadpool(store.list_sessions, limit, offset)
+        principal = request.state.principal
+        owner = None if principal["role"] == "admin" or principal["kind"] == "api_key" \
+            else principal["user_id"]
+        return await run_in_threadpool(store.list_sessions, limit, offset, owner)
 
     @app.post("/sessions", status_code=201, dependencies=auth)
-    async def create_session(data: SessionCreate):
-        return await run_in_threadpool(store.create_session, data.agent_id, data.title)
+    async def create_session(data: SessionCreate, request: Request):
+        principal = request.state.principal
+        agent = await run_in_threadpool(store.get_agent, data.agent_id)
+        if agent.get("owner_id") and not owns(principal, agent["owner_id"]):
+            raise GatewayError(404, "agent_not_found", "Agent 不存在，请先创建 Agent。")
+        return await run_in_threadpool(store.create_session, data.agent_id, data.title,
+                                       principal["user_id"] or None)
 
     @app.get("/sessions/{session_id}", dependencies=auth)
-    async def get_session(session_id: str):
-        return await run_in_threadpool(store.get_session, session_id)
+    async def get_session(session_id: str, request: Request):
+        return await session_for(request, session_id)
 
     @app.patch("/sessions/{session_id}", dependencies=auth)
     async def update_session(session_id: str, data: SessionUpdate, request: Request):
+        await session_for(request, session_id)
         session = await run_in_threadpool(store.update_session, session_id, title=data.title)
         await record_audit(request, "session.update", target_type="session",
                            target_id=session_id, details={"fields": ["title"]})
@@ -471,42 +515,49 @@ def create_app(settings: Settings | None = None,
 
     @app.delete("/sessions/{session_id}", status_code=204, dependencies=auth)
     async def delete_session(session_id: str, request: Request):
+        await session_for(request, session_id)
         await run_in_threadpool(store.delete_session, session_id)
         await record_audit(request, "session.delete", target_type="session",
                            target_id=session_id)
 
     @app.get("/sessions/{session_id}/messages", dependencies=auth)
-    async def get_messages(session_id: str,
+    async def get_messages(session_id: str, request: Request,
                            limit: int = Query(default=MESSAGE_PAGE, ge=1, le=5000),
                            offset: int = Query(default=0, ge=0)):
-        await run_in_threadpool(store.get_session, session_id)
+        await session_for(request, session_id)
         return await run_in_threadpool(store.messages, session_id, limit=limit, offset=offset)
 
     @app.delete("/sessions/{session_id}/messages", dependencies=auth)
     async def clear_messages(session_id: str, request: Request):
+        await session_for(request, session_id)
         deleted = await run_in_threadpool(store.clear_messages, session_id)
         await record_audit(request, "session.clear", target_type="session",
                            target_id=session_id, details={"deleted": deleted})
         return {"deleted": deleted}
 
     @app.get("/sessions/{session_id}/requests/{request_id}", dependencies=auth)
-    async def get_request(session_id: str, request_id: str):
-        await run_in_threadpool(store.get_session, session_id)
+    async def get_request(session_id: str, request_id: str, request: Request):
+        await session_for(request, session_id)
         run = await run_in_threadpool(store.find_request, session_id, request_id)
         if run is None:
             raise GatewayError(404, "request_not_found", "请求尚未开始或不存在。")
         return run
 
     @app.get("/runs/{run_id}", dependencies=auth)
-    async def get_run(run_id: str):
-        return await run_in_threadpool(store.get_run, run_id)
+    async def get_run(run_id: str, request: Request):
+        run = await run_in_threadpool(store.get_run, run_id)
+        session = await run_in_threadpool(store.get_session, run["session_id"])
+        ensure_session_access(request.state.principal, session)
+        return run
 
     @app.get("/audit", dependencies=auth)
-    async def list_audit(limit: int = Query(default=100, ge=1, le=1000),
+    async def list_audit(request: Request,
+                         limit: int = Query(default=100, ge=1, le=1000),
                          offset: int = Query(default=0, ge=0),
                          action: str | None = Query(default=None, max_length=100),
                          result: str | None = Query(default=None, max_length=20)):
-        """审计记录（新→旧）。阶段 3 接入用户后限定为管理员。"""
+        """审计记录（新→旧），仅管理员。"""
+        require_admin(request)
         return await run_in_threadpool(audit.list, limit, offset,
                                        action=action, result=result)
 
@@ -523,10 +574,12 @@ def create_app(settings: Settings | None = None,
     @app.post("/api-keys", status_code=201, dependencies=auth)
     async def create_api_key(data: ApiKeyCreate, request: Request):
         require_admin(request)
-        unknown = set(data.scopes) - API_SCOPES
-        if unknown:
-            raise GatewayError(422, "invalid_request",
-                               f"未知的 scope：{', '.join(sorted(unknown))}")
+        # 允许自定义 scope（例如某个代理前缀的 reports），但只接受简单标识符。
+        for scope in data.scopes:
+            if not scope or len(scope) > 50 or not scope[0].isalpha() \
+                    or not all(char.isalnum() or char in "_-:" for char in scope):
+                raise GatewayError(422, "invalid_request",
+                                   "scope 只能是以字母开头的字母/数字/-/_/: 组合。")
         key_id, secret, plaintext = new_api_key()
         now = datetime.now(timezone.utc)
         expires_at = ((now + timedelta(days=data.expires_in_days)).isoformat()
@@ -555,13 +608,13 @@ def create_app(settings: Settings | None = None,
                            target_id=key_id)
 
     @app.post("/sessions/{session_id}/ticket", dependencies=auth)
-    async def create_ticket(session_id: str):
+    async def create_ticket(session_id: str, request: Request):
         """给浏览器换一张连接 WebSocket 的一次性票据。
 
         这一步用普通 HTTP 完成，因此可以携带 Authorization 头；
         拿到票据后，页面就能连 `.../stream?ticket=...`。
         """
-        await run_in_threadpool(store.get_session, session_id)
+        await session_for(request, session_id)
         value, seconds = tickets.issue(f"session:{session_id}")
         return {"ticket": value, "session_id": session_id, "expires_in": seconds}
 
@@ -580,7 +633,8 @@ def create_app(settings: Settings | None = None,
         return {"ticket": value, "path": data.path, "expires_in": seconds}
 
     @app.post("/sessions/{session_id}/chat", dependencies=auth)
-    async def chat(session_id: str, data: ChatInput):
+    async def chat(session_id: str, data: ChatInput, request: Request):
+        await session_for(request, session_id)
         async with aclosing(app.state.chat.stream(session_id, data.content, data.request_id)) as events:
             async for event in events:
                 if event["type"] == "error":
@@ -608,7 +662,8 @@ def create_app(settings: Settings | None = None,
         log_websocket("ws.connect", session_id=session_id, trace_id=trace_id,
                       path=websocket.url.path)
         try:
-            await run_in_threadpool(store.get_session, session_id)
+            session = await run_in_threadpool(store.get_session, session_id)
+            ensure_session_access(principal, session)
         except GatewayError as error:
             await websocket.send_json(ws_error(session_id, error))
             await websocket.close(code=1008)
@@ -682,8 +737,10 @@ def create_app(settings: Settings | None = None,
     def make_forwarder(route):
         async def forward(request: Request, path: str) -> Response:
             principal = request.state.principal
-            if principal["kind"] == "api_key" and "proxy" not in principal["scopes"]:
-                raise GatewayError(403, "forbidden", "该 API Key 缺少权限：proxy")
+            if principal["kind"] == "api_key":
+                if "proxy" not in principal["scopes"] and \
+                        route.required_scope not in principal["scopes"]:
+                    raise GatewayError(403, "forbidden", "该 API Key 缺少代理权限。")
             return await request.app.state.proxy.forward(request, route, path)
         return forward
 
@@ -694,7 +751,8 @@ def create_app(settings: Settings | None = None,
             if principal is None:
                 await websocket.close(code=1008)
                 return
-            if principal["kind"] == "api_key" and "proxy" not in principal["scopes"]:
+            if principal["kind"] == "api_key" and "proxy" not in principal["scopes"] \
+                    and route.required_scope not in principal["scopes"]:
                 await websocket.close(code=1008)
                 return
             await websocket.app.state.proxy.forward_websocket(websocket, route, path)
