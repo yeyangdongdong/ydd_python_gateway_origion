@@ -7,22 +7,25 @@
 
 | 提案 | 状态 | 一句话 |
 | --- | --- | --- |
+| [router-refactor.md](router-refactor.md) | **待实施** | 拆 routers + 归属检查下沉，对外行为不变 |
 | [health-checks.md](health-checks.md) | **已实现 v1** | 主动探活 + 现有被动冷却，摘除坏上游 |
-| [cookie-sso.md](cookie-sso.md) | 未实现 | 网关登录页 + 签名 Cookie，多个被代理工具统一登录 |
+| [cookie-sso.md](cookie-sso.md) | 未实现（已被本地账号会话部分覆盖） | 网关登录页 + 签名 Cookie，多个被代理工具统一登录 |
 | [affinity.md](affinity.md) | 未实现 | Cookie / header / IP 亲和，让同一客户端固定到同一上游 |
 | [tcp-proxy.md](tcp-proxy.md) | 未实现（建议不做） | 非 HTTP 协议：gRPC 不可行，TCP 按需且建议外置 |
 
 ## 共同前提
 
-四项都是**可选能力**：默认关闭，不开启时现有 `routes.json` 字段、接口与错误码保持不变。
+- `router-refactor` 是**纯重构**：不改接口、不改行为，只调整代码结构与归属检查位置；
+- 其余三项是**可选能力**：默认关闭，不开启时 `routes.json` 字段、接口与错误码保持不变。
 
-四项都需要同一块基础设施：一个 HMAC 签名小模块（`GATEWAY_COOKIE_SECRET`），
-Cookie 登录与亲和 cookie 共用；健康检查不需要它。
+早期方案里的 `GATEWAY_COOKIE_SECRET` 已不需要：本地账号会话使用数据库中的不透明随机 token（只存 SHA-256），
+不依赖签名 Cookie。只有将来实现“粘性会话”时才需要单独的 HMAC 密钥。
 
 ## 建议顺序
 
 | 顺序 | 项 | 用户价值 | 成本 | 风险 |
 | --- | --- | --- | --- | --- |
+| 0（先做） | 拆分路由 + 归属下沉 | 中（可维护性、堵住绕过隔离的入口） | 1.5–2 天 | 低（行为不变） |
 | 1（已完成） | 主动健康检查 | 高（少 502） | ~150 行 + 5 测试 | 低 |
 | 2 | Cookie SSO | 高（浏览器体验） | ~150 行 + 8 测试 | 中（CSRF 面变大） |
 | 3 | 粘性会话 | 按需 | ~100 行 + 5 测试 | 低（牺牲均衡） |
