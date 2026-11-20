@@ -1,6 +1,7 @@
 """网络入口：校验输入、调用业务逻辑、把结果返回给客户端。"""
 
 import asyncio
+import json
 import logging
 import secrets
 import time
@@ -21,8 +22,9 @@ from starlette.websockets import WebSocketDisconnect
 
 from .access_log import AccessLogMiddleware, log_websocket
 from .audit import AuditTrail
-from .auth import (COOKIE_NAME, DUMMY_HASH, LoginLimiter, hash_token, legacy_principal,
-                   new_session_token, session_principal, verify_password)
+from .auth import (COOKIE_NAME, DUMMY_HASH, LoginLimiter, api_key_principal,
+                   hash_api_key, hash_token, legacy_principal, new_api_key,
+                   new_session_token, parse_api_key, session_principal, verify_password)
 from .config import Settings
 from .errors import GatewayError
 from .logging_setup import TRACE_ID, LogSettings
@@ -77,6 +79,15 @@ class ChatInput(InputModel):
 class ProxyTicketInput(InputModel):
     # 要连接的代理 WS 路径，必须落在已配置的前缀下。
     path: Text = Field(max_length=2000)
+
+
+API_SCOPES = {"sessions", "agents", "audit", "proxy"}
+
+
+class ApiKeyCreate(InputModel):
+    name: Text = Field(max_length=100)
+    scopes: list[str] = Field(default_factory=list, max_length=10)
+    expires_in_days: int | None = Field(default=None, ge=1, le=3650)
 
 
 def create_app(settings: Settings | None = None,
@@ -168,18 +179,41 @@ def create_app(settings: Settings | None = None,
             await run_in_threadpool(store.touch_auth_session, row["id"], now.isoformat())
         return session_principal(row)
 
+    async def api_key_from_header(authorization: str | None) -> dict | None:
+        if not authorization or not authorization.startswith("Bearer "):
+            return None
+        parsed = parse_api_key(authorization[7:].strip())
+        if parsed is None:
+            return None
+        key_id, secret = parsed
+        row = await run_in_threadpool(store.find_api_key, key_id)
+        if row is None or row["revoked_at"]:
+            return None
+        if not secrets.compare_digest(hash_api_key(secret), row["key_hash"]):
+            return None
+        now = datetime.now(timezone.utc)
+        if row["expires_at"] and row["expires_at"] <= now.isoformat():
+            return None
+        last_used = row["last_used_at"]
+        if not last_used or (now - datetime.fromisoformat(last_used)).total_seconds() > 60:
+            try:
+                await run_in_threadpool(store.touch_api_key, key_id, now.isoformat())
+            except Exception:
+                pass
+        return api_key_principal(row, frozenset(json.loads(row["scopes"] or "[]")))
+
     async def authenticate(request: Request, authorization: str | None) -> dict | None:
         if settings.auth_mode == "legacy":
             if token_matches(authorization) or legacy_open():
                 return legacy_principal()
-            return None
+            return await api_key_from_header(authorization)
         principal = await session_from_cookie(request.cookies.get(COOKIE_NAME))
         if principal is not None:
             return principal
         # 本地模式下旧的共享 token 仍可用（映射为管理员），方便脚本平滑迁移。
         if token_matches(authorization):
             return legacy_principal()
-        return None
+        return await api_key_from_header(authorization)
 
     def enforce_csrf(request: Request, principal: dict) -> None:
         """只有 Cookie 认证需要 CSRF；Bearer 头不会被浏览器自动带上。"""
@@ -202,6 +236,25 @@ def create_app(settings: Settings | None = None,
                                "请先登录，或提供正确的 Authorization: Bearer <token>。")
         enforce_csrf(request, principal)
         request.state.principal = principal
+        if principal["kind"] == "api_key":
+            enforce_scope(request, principal)
+
+    def enforce_scope(request: Request, principal: dict) -> None:
+        """API Key 按资源级别授权；会话/Agent/审计各自需要对应 scope。"""
+        path = request.url.path
+        for prefix, scope in (("/sessions", "sessions"), ("/runs", "sessions"),
+                              ("/agents", "agents"), ("/audit", "audit")):
+            if path == prefix or path.startswith(prefix + "/"):
+                if scope not in principal["scopes"]:
+                    raise GatewayError(403, "forbidden", f"该 API Key 缺少权限：{scope}")
+                return
+        if path.startswith("/api-keys"):
+            raise GatewayError(403, "forbidden", "API Key 不能管理 API Key。")
+
+    def require_admin(request: Request) -> None:
+        principal = getattr(request.state, "principal", None)
+        if principal is None or principal["role"] != "admin":
+            raise GatewayError(403, "forbidden", "需要管理员权限。")
 
     auth = [Depends(require_auth)]
 
@@ -213,6 +266,9 @@ def create_app(settings: Settings | None = None,
                 return principal
         if legacy_open() or token_matches(websocket.headers.get("authorization")):
             return legacy_principal()
+        api = await api_key_from_header(websocket.headers.get("authorization"))
+        if api is not None:
+            return api
         ticket = websocket.query_params.get("ticket")
         if ticket and tickets.take(ticket) == ticket_resource:
             return legacy_principal()
@@ -454,6 +510,50 @@ def create_app(settings: Settings | None = None,
         return await run_in_threadpool(audit.list, limit, offset,
                                        action=action, result=result)
 
+    @app.get("/api-keys", dependencies=auth)
+    async def list_api_keys(request: Request):
+        require_admin(request)
+        rows = await run_in_threadpool(store.list_api_keys)
+        return [{"id": row["id"], "name": row["name"], "prefix": row["key_prefix"],
+                 "scopes": json.loads(row["scopes"] or "[]"),
+                 "owner_id": row["owner_id"], "expires_at": row["expires_at"],
+                 "created_at": row["created_at"], "last_used_at": row["last_used_at"],
+                 "revoked": bool(row["revoked_at"])} for row in rows]
+
+    @app.post("/api-keys", status_code=201, dependencies=auth)
+    async def create_api_key(data: ApiKeyCreate, request: Request):
+        require_admin(request)
+        unknown = set(data.scopes) - API_SCOPES
+        if unknown:
+            raise GatewayError(422, "invalid_request",
+                               f"未知的 scope：{', '.join(sorted(unknown))}")
+        key_id, secret, plaintext = new_api_key()
+        now = datetime.now(timezone.utc)
+        expires_at = ((now + timedelta(days=data.expires_in_days)).isoformat()
+                      if data.expires_in_days else None)
+        principal = request.state.principal
+        await run_in_threadpool(store.create_api_key, {
+            "id": key_id, "name": data.name, "key_hash": hash_api_key(secret),
+            "key_prefix": secret[:8], "scopes": json.dumps(sorted(set(data.scopes))),
+            "owner_id": principal["user_id"] or "",
+            "expires_at": expires_at, "created_at": now.isoformat(),
+        })
+        await record_audit(request, "api_key.create", target_type="api_key",
+                           target_id=key_id,
+                           details={"name": data.name, "scopes": sorted(set(data.scopes))})
+        return {"id": key_id, "name": data.name, "key": plaintext,
+                "prefix": secret[:8], "scopes": sorted(set(data.scopes)),
+                "expires_at": expires_at}
+
+    @app.delete("/api-keys/{key_id}", status_code=204, dependencies=auth)
+    async def revoke_api_key(key_id: str, request: Request):
+        require_admin(request)
+        removed = await run_in_threadpool(store.revoke_api_key, key_id)
+        if not removed:
+            raise GatewayError(404, "api_key_not_found", "API Key 不存在或已撤销。")
+        await record_audit(request, "api_key.revoke", target_type="api_key",
+                           target_id=key_id)
+
     @app.post("/sessions/{session_id}/ticket", dependencies=auth)
     async def create_ticket(session_id: str):
         """给浏览器换一张连接 WebSocket 的一次性票据。
@@ -499,6 +599,9 @@ def create_app(settings: Settings | None = None,
         close_code = None
         principal = await websocket_principal(websocket, f"session:{session_id}")
         if principal is None:
+            await websocket.close(code=1008)
+            return
+        if principal["kind"] == "api_key" and "sessions" not in principal["scopes"]:
             await websocket.close(code=1008)
             return
         await websocket.accept()
@@ -578,14 +681,20 @@ def create_app(settings: Settings | None = None,
     # 放在最后注册，内置接口优先，不会被前缀遮蔽（加载时也已拒绝冲突前缀）。
     def make_forwarder(route):
         async def forward(request: Request, path: str) -> Response:
+            principal = request.state.principal
+            if principal["kind"] == "api_key" and "proxy" not in principal["scopes"]:
+                raise GatewayError(403, "forbidden", "该 API Key 缺少权限：proxy")
             return await request.app.state.proxy.forward(request, route, path)
         return forward
 
     def make_ws_forwarder(route):
         async def forward(websocket: WebSocket, path: str) -> None:
-            # 准入：Cookie 会话 / Bearer / 代理 WS 的一次性票据（绑定到这条路径）。
+            # 准入：Cookie 会话 / Bearer（旧 token 或 API Key）/ 代理 WS 的一次性票据。
             principal = await websocket_principal(websocket, f"ws:{websocket.url.path}")
             if principal is None:
+                await websocket.close(code=1008)
+                return
+            if principal["kind"] == "api_key" and "proxy" not in principal["scopes"]:
                 await websocket.close(code=1008)
                 return
             await websocket.app.state.proxy.forward_websocket(websocket, route, path)

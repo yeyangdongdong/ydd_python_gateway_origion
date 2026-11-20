@@ -453,7 +453,20 @@ remaining   = budget − fixed − notice
 - **会话**：不透明 token，服务端可吊销；登出/重置密码立即失效；`last_seen_at` 最多每 60 秒写一次。
 - **CSRF**：Cookie 认证的非幂等请求校验 `Origin` / `Sec-Fetch-Site`（同源放行，跨站 `403 csrf_rejected`）；Bearer 不受影响。
 - **限速**：按 `(IP, 用户名)` 计数，超过阈值锁定；失败写入审计。
-- 认证顺序：Cookie 会话 → 共享 token；WS 额外保留票据（浏览器取票仍可用，但 Cookie 已足够）。
+- 认证顺序：Cookie 会话 → 共享 token → API Key；WS 额外保留票据（浏览器取票仍可用，但 Cookie 已足够）。
+
+### 8.1c API Key（机器身份）
+
+```text
+明文：ydd_<16 位 id>_<32 字节 secret>
+存储：id + sha256(secret) + 前 8 位前缀（用于列表展示）
+校验：按 id 查行 → 常量时间比较哈希 → 检查撤销/过期 → 读取 scopes
+```
+
+- scope 按资源检查：`sessions`（会话/消息/聊天/WS）、`agents`、`audit`、`proxy`；
+- API Key 不能管理 API Key，也不能默认读审计；
+- `last_used_at` 最多每 60 秒更新一次，避免每个请求一个写事务；
+- 管理员可随时撤销；数据库泄露不会直接得到可用的 Key（只有哈希）。
 
 ### 8.2 票据生命周期
 

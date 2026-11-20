@@ -102,3 +102,31 @@ def session_principal(session: dict) -> dict:
     return {"kind": "session", "user_id": session["user_id"],
             "username": session["username"], "role": session["role"],
             "scopes": frozenset()}
+
+
+API_KEY_PREFIX = "ydd_"
+
+
+def new_api_key() -> tuple[str, str, str]:
+    """返回 (key_id, secret, 明文)。明文只展示一次，库里只存 secret 的哈希。"""
+    key_id = secrets.token_hex(8)
+    secret = secrets.token_urlsafe(32)
+    return key_id, secret, f"{API_KEY_PREFIX}{key_id}_{secret}"
+
+
+def hash_api_key(secret: str) -> str:
+    return hashlib.sha256(secret.encode("utf-8")).hexdigest()
+
+
+def parse_api_key(value: str) -> tuple[str, str] | None:
+    if not value.startswith(API_KEY_PREFIX):
+        return None
+    key_id, _, secret = value[len(API_KEY_PREFIX):].partition("_")
+    if len(key_id) != 16 or not secret:
+        return None
+    return key_id, secret
+
+
+def api_key_principal(row: dict, scopes: frozenset[str]) -> dict:
+    return {"kind": "api_key", "user_id": "", "username": row["name"],
+            "role": "api_key", "scopes": scopes}

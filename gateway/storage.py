@@ -116,6 +116,23 @@ MIGRATIONS: list[tuple[int, tuple[str, ...]]] = [
         "CREATE INDEX IF NOT EXISTS auth_sessions_user ON auth_sessions(user_id)",
         "CREATE INDEX IF NOT EXISTS auth_sessions_token ON auth_sessions(token_hash)",
     )),
+    (4, (
+        """
+        CREATE TABLE IF NOT EXISTS api_keys (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            key_hash TEXT NOT NULL,
+            key_prefix TEXT NOT NULL,
+            scopes TEXT NOT NULL,
+            owner_id TEXT,
+            expires_at TEXT,
+            created_at TEXT NOT NULL,
+            last_used_at TEXT,
+            revoked_at TEXT
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS api_keys_owner ON api_keys(owner_id)",
+    )),
 ]
 
 
@@ -435,6 +452,45 @@ class Store:
         with self.connect() as db:
             db.execute("UPDATE auth_sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL",
                        (now(), user_id))
+
+    # ------------------------------------------------------------ API Key
+
+    def create_api_key(self, event: dict) -> None:
+        with self.connect() as db:
+            db.execute("""
+                INSERT INTO api_keys (id, name, key_hash, key_prefix, scopes, owner_id,
+                                      expires_at, created_at, last_used_at, revoked_at)
+                VALUES (:id, :name, :key_hash, :key_prefix, :scopes, :owner_id,
+                        :expires_at, :created_at, NULL, NULL)
+            """, event)
+
+    def find_api_key(self, key_id: str) -> dict | None:
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM api_keys WHERE id = ?", (key_id,)).fetchone()
+        return dict(row) if row else None
+
+    def list_api_keys(self, owner_id: str | None = None) -> list[dict]:
+        query = ("SELECT id, name, key_prefix, scopes, owner_id, expires_at, created_at,"
+                 " last_used_at, revoked_at FROM api_keys")
+        parameters: tuple = ()
+        if owner_id:
+            query += " WHERE owner_id = ?"
+            parameters = (owner_id,)
+        query += " ORDER BY created_at DESC"
+        with self.connect() as db:
+            rows = db.execute(query, parameters).fetchall()
+        return [dict(row) for row in rows]
+
+    def revoke_api_key(self, key_id: str) -> bool:
+        with self.connect() as db:
+            cursor = db.execute(
+                "UPDATE api_keys SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
+                (now(), key_id))
+            return cursor.rowcount > 0
+
+    def touch_api_key(self, key_id: str, timestamp: str) -> None:
+        with self.connect() as db:
+            db.execute("UPDATE api_keys SET last_used_at = ? WHERE id = ?", (timestamp, key_id))
 
     @staticmethod
     def _row(db: sqlite3.Connection, query: str, *parameters: object) -> sqlite3.Row | None:

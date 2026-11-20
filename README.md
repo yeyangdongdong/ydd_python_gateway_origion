@@ -551,6 +551,24 @@ GATEWAY_COOKIE_SECURE=false     # 走 HTTPS 时设为 true
 - 登录失败按 `(IP, 用户名)` 计数，5 次失败锁定 15 分钟（`GATEWAY_LOGIN_*`），失败事件写入审计；
 - 用户不存在时也执行一次密码哈希，避免通过响应时间枚举用户名。
 
+### API Key（给其他服务）
+
+其他服务访问网关时用 API Key，而不是共享密码：
+
+```powershell
+# 管理员登录后调用（或带 GATEWAY_TOKEN）
+$key = Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/api-keys `
+  -Headers @{ Authorization = "Bearer <管理员token>" } -ContentType application/json `
+  -Body '{"name":"报表服务","scopes":["sessions"],"expires_in_days":365}'
+$key.key   # 明文只返回这一次，请立即保存
+```
+
+- 明文格式 `ydd_<id>_<secret>`，数据库只存 secret 的 SHA-256 与 8 位前缀；
+- scopes 可选：`sessions`（会话/消息/聊天/WS）、`agents`（Agent 管理）、`audit`（审计查询）、`proxy`（反向代理前缀）；
+- 可设过期时间、可随时撤销（`DELETE /api-keys/{id}`）；`last_used_at` 最多每分钟更新一次；
+- API Key **不能**管理 API Key，也不能读 `/audit`（除非同时给了 `audit` scope）；
+- 请求方式：`Authorization: Bearer ydd_...`。
+
 ### 认证相关接口
 
 | 方法 | 路径 | 说明 |
@@ -559,6 +577,9 @@ GATEWAY_COOKIE_SECURE=false     # 走 HTTPS 时设为 true
 | POST | `/login` | 表单登录，成功 303 并下发 Cookie |
 | POST | `/logout` | 吊销当前会话并清除 Cookie（需登录，带 CSRF 校验） |
 | GET | `/auth/status` | 当前认证模式与登录用户 |
+| GET | `/api-keys` | 列出 API Key（管理员） |
+| POST | `/api-keys` | 创建 API Key，返回一次性明文（管理员） |
+| DELETE | `/api-keys/{id}` | 撤销 API Key（管理员） |
 
 ## 13. 基础版范围
 

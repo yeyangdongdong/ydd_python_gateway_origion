@@ -359,6 +359,12 @@ WS    /finance/live         →  ws://127.0.0.1:9001/live
 | POST | `/login` | `application/x-www-form-urlencoded`：`username`、`password`、可选 `next`；成功 303 + `Set-Cookie: ydd_session`，失败 303 到 `/login?error=invalid|locked` |
 | POST | `/logout` | 吊销当前会话并清 Cookie（需登录；Cookie 认证时校验 CSRF 来源） |
 | GET | `/auth/status` | `{"auth_mode","authenticated","user"}`，无需登录 |
+| GET | `/api-keys` | 列出 API Key（管理员；不含明文） |
+| POST | `/api-keys` | `{"name","scopes","expires_in_days"}` → 返回一次性明文（管理员） |
+| DELETE | `/api-keys/{key_id}` | 撤销（管理员）；不存在或已撤销 → 404 |
+
+API Key 认证：`Authorization: Bearer ydd_<id>_<secret>`，按资源检查 scope：
+`sessions` / `agents` / `audit` / `proxy`。缺少 scope → `403 forbidden`；Key 不能管理 Key。
 
 登录后的浏览器请求自动携带 Cookie；脚本仍可用 `Authorization: Bearer <GATEWAY_TOKEN>`（映射为管理员）。
 Cookie 认证的非幂等请求（POST/PUT/PATCH/DELETE）需要同源的 `Origin` 或 `Sec-Fetch-Site`，否则 `403 csrf_rejected`。
