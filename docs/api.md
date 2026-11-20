@@ -305,6 +305,19 @@ Agent 是"名称 + 系统提示词 + 模型名"的组合。默认 Agent（`id=de
 
 同上结构，按运行 ID 查询。不存在 → `404 run_not_found`。
 
+#### `GET /audit`
+
+审计事件（新→旧），需鉴权。参数：`limit`（1–1000，默认 100）、`offset`、`action`、`result`。
+
+```json
+[{"id": "9f2c...", "ts": "2026-11-21T00:30:12.428+00:00", "trace_id": "b4c8...",
+  "action": "agent.delete", "result": "ok", "reason": "", "ip": "192.168.1.20",
+  "actor": {"type": "token", "id": "legacy", "name": "gateway-token"},
+  "target": {"type": "agent", "id": "2b1c..."}, "details": {}}]
+```
+
+`action` 取值见 README 的"审计留痕"表；`details` 是对象（写库时存 JSON 字符串，查询接口已还原）。
+
 ### 2.8 反向代理前缀（按 `routes.json` 动态注册）
 
 只有配置了 `routes.json` 才存在，路径由配置决定，因此不出现在 `/docs` 的固定接口里（但会作为 `/prefix/{path}` 出现）。

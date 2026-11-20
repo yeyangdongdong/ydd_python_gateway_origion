@@ -18,9 +18,10 @@ from starlette.concurrency import run_in_threadpool
 from starlette.websockets import WebSocketDisconnect
 
 from .access_log import AccessLogMiddleware, log_websocket
+from .audit import AuditTrail
 from .config import Settings
 from .errors import GatewayError
-from .logging_setup import LogSettings
+from .logging_setup import TRACE_ID, LogSettings
 from .provider import ModelProvider
 from .proxy import Proxy, load_routes, match_route
 from .service import ChatService
@@ -78,12 +79,19 @@ def create_app(settings: Settings | None = None,
     settings = settings or Settings.from_env()
     store = Store(settings.db_path)
     tickets = TicketStore()
+    audit = AuditTrail(store)
     # 启动时就把路由表读进内存：配置写错立刻报错，而不是等第一个请求。
     routes = load_routes(settings.routes_path)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         await run_in_threadpool(store.initialize, settings.model)
+        try:
+            await run_in_threadpool(audit.append, action="gateway.start", actor_type="system",
+                                    actor_name="gateway",
+                                    details={"version": "0.1.0", "routes": len(routes)})
+        except Exception:      # 审计不可用不应阻止服务启动
+            logging.getLogger(__name__).exception("Startup audit failed")
         provider = ModelProvider(settings)
         app.state.chat = ChatService(store, provider, settings)
         app.state.proxy = Proxy(routes, settings.proxy_timeout) if routes else None
@@ -131,6 +139,28 @@ def create_app(settings: Settings | None = None,
 
     auth = [Depends(require_auth)]
 
+    def audit_context(request: Request) -> dict:
+        """阶段 3 接入用户后，这里会换成真实身份；现在只有 token/anonymous 两种。"""
+        if settings.gateway_token:
+            return {"actor_type": "token", "actor_id": "legacy",
+                    "actor_name": "gateway-token",
+                    "ip": request.client.host if request.client else "",
+                    "trace_id": TRACE_ID.get()}
+        return {"actor_type": "anonymous", "actor_id": "", "actor_name": "anonymous",
+                "ip": request.client.host if request.client else "",
+                "trace_id": TRACE_ID.get()}
+
+    async def record_audit(request: Request, action: str, *, target_type: str = "",
+                           target_id: str = "", details: dict | None = None,
+                           result: str = "ok", reason: str = "") -> None:
+        try:
+            await run_in_threadpool(
+                audit.append, action=action, **audit_context(request),
+                target_type=target_type, target_id=target_id,
+                details=details, result=result, reason=reason)
+        except Exception:      # 审计是旁路：失败只记 ERROR，不改变业务结果
+            logging.getLogger(__name__).exception("Audit append failed: %s", action)
+
     @app.exception_handler(GatewayError)
     async def handle_gateway_error(request: Request, error: GatewayError):
         return JSONResponse(error.as_body(), status_code=error.status_code)
@@ -169,20 +199,30 @@ def create_app(settings: Settings | None = None,
         return await run_in_threadpool(store.list_agents, limit, offset)
 
     @app.post("/agents", status_code=201, dependencies=auth)
-    async def create_agent(data: AgentCreate):
-        return await run_in_threadpool(store.create_agent, data.name, data.system_prompt,
-                                      data.model or settings.model)
+    async def create_agent(data: AgentCreate, request: Request):
+        agent = await run_in_threadpool(store.create_agent, data.name, data.system_prompt,
+                                        data.model or settings.model)
+        await record_audit(request, "agent.create", target_type="agent",
+                           target_id=agent["id"],
+                           details={"name": agent["name"], "model": agent["model"]})
+        return agent
 
     @app.patch("/agents/{agent_id}", dependencies=auth)
-    async def update_agent(agent_id: str, data: AgentUpdate):
+    async def update_agent(agent_id: str, data: AgentUpdate, request: Request):
         if data.name is None and data.system_prompt is None and data.model is None:
             raise GatewayError(422, "invalid_request", "请至少提供一个要修改的字段。")
-        return await run_in_threadpool(store.update_agent, agent_id, name=data.name,
-                                       system_prompt=data.system_prompt, model=data.model)
+        agent = await run_in_threadpool(store.update_agent, agent_id, name=data.name,
+                                        system_prompt=data.system_prompt, model=data.model)
+        changed = [field for field in ("name", "system_prompt", "model")
+                   if getattr(data, field) is not None]
+        await record_audit(request, "agent.update", target_type="agent", target_id=agent_id,
+                           details={"fields": changed})
+        return agent
 
     @app.delete("/agents/{agent_id}", status_code=204, dependencies=auth)
-    async def delete_agent(agent_id: str):
+    async def delete_agent(agent_id: str, request: Request):
         await run_in_threadpool(store.delete_agent, agent_id)
+        await record_audit(request, "agent.delete", target_type="agent", target_id=agent_id)
 
     @app.get("/sessions", dependencies=auth)
     async def list_sessions(limit: int = Query(default=SESSION_PAGE, ge=1, le=1000),
@@ -198,12 +238,17 @@ def create_app(settings: Settings | None = None,
         return await run_in_threadpool(store.get_session, session_id)
 
     @app.patch("/sessions/{session_id}", dependencies=auth)
-    async def update_session(session_id: str, data: SessionUpdate):
-        return await run_in_threadpool(store.update_session, session_id, title=data.title)
+    async def update_session(session_id: str, data: SessionUpdate, request: Request):
+        session = await run_in_threadpool(store.update_session, session_id, title=data.title)
+        await record_audit(request, "session.update", target_type="session",
+                           target_id=session_id, details={"fields": ["title"]})
+        return session
 
     @app.delete("/sessions/{session_id}", status_code=204, dependencies=auth)
-    async def delete_session(session_id: str):
+    async def delete_session(session_id: str, request: Request):
         await run_in_threadpool(store.delete_session, session_id)
+        await record_audit(request, "session.delete", target_type="session",
+                           target_id=session_id)
 
     @app.get("/sessions/{session_id}/messages", dependencies=auth)
     async def get_messages(session_id: str,
@@ -213,8 +258,10 @@ def create_app(settings: Settings | None = None,
         return await run_in_threadpool(store.messages, session_id, limit=limit, offset=offset)
 
     @app.delete("/sessions/{session_id}/messages", dependencies=auth)
-    async def clear_messages(session_id: str):
+    async def clear_messages(session_id: str, request: Request):
         deleted = await run_in_threadpool(store.clear_messages, session_id)
+        await record_audit(request, "session.clear", target_type="session",
+                           target_id=session_id, details={"deleted": deleted})
         return {"deleted": deleted}
 
     @app.get("/sessions/{session_id}/requests/{request_id}", dependencies=auth)
@@ -228,6 +275,15 @@ def create_app(settings: Settings | None = None,
     @app.get("/runs/{run_id}", dependencies=auth)
     async def get_run(run_id: str):
         return await run_in_threadpool(store.get_run, run_id)
+
+    @app.get("/audit", dependencies=auth)
+    async def list_audit(limit: int = Query(default=100, ge=1, le=1000),
+                         offset: int = Query(default=0, ge=0),
+                         action: str | None = Query(default=None, max_length=100),
+                         result: str | None = Query(default=None, max_length=20)):
+        """审计记录（新→旧）。阶段 3 接入用户后限定为管理员。"""
+        return await run_in_threadpool(audit.list, limit, offset,
+                                       action=action, result=result)
 
     @app.post("/sessions/{session_id}/ticket", dependencies=auth)
     async def create_ticket(session_id: str):

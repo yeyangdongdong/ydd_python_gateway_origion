@@ -333,6 +333,7 @@ ydd_python_gateway_origion/
 │   ├── proxy_health.py         # 反向代理的主动探活
 │   ├── access_log.py           # 访问日志中间件与参数脱敏
 │   ├── logging_setup.py        # JSON 格式化、按类别/服务分文件、异步写盘
+│   ├── audit.py                # 审计双写（数据库 + 文件）
 │   ├── storage.py              # SQLite 表、迁移和读写操作
 │   ├── tickets.py              # 浏览器连接 WebSocket 用的一次性票据
 │   ├── config.py               # 配置加载和检查
@@ -444,7 +445,7 @@ new WebSocket(`ws://${location.host}/finance/live?ticket=${ticket}`);
 
 `routes.json` 已被 `.gitignore` 忽略（每台机器的端口不同），模板 `routes.json.example` 会提交。Windows 上用记事本或 PowerShell 保存带 BOM 的文件也能正常读取。
 
-## 11. 日志
+## 11. 日志与审计
 
 网关把日志写成 JSON Lines，按类别落到 `GATEWAY_LOG_DIR` 下：
 
@@ -454,7 +455,7 @@ D:\Document\logs\ydd-gateway\
 ├── app\2026-11-21.log         # 启动、迁移、未预期异常
 ├── proxy\2026-11-21.log       # 选路、冷却、探活
 ├── auth\2026-11-21.log        # 登录与会话（阶段 3 起）
-├── audit\2026-11-21.log       # 审计留痕（阶段 2 起）
+├── audit\2026-11-21.log       # 审计留痕（与 audit 表双写）
 └── services\finance\2026-11-21.log   # 被代理服务各自的访问日志
 ```
 
@@ -479,6 +480,32 @@ D:\Document\logs\ydd-gateway\
 - 写盘走队列线程，不阻塞事件循环；文件按天切分、超过大小追加序号、按保留天数清理。
 
 采集：日志是标准 JSON Lines，可直接用 Vector / Filebeat / Fluent Bit 送到 Loki / ELK；容器里设置 `GATEWAY_LOG_STDOUT=true` 即可只走 stdout。
+
+### 审计留痕
+
+数据变更会**双写**：`audit_log` 表（可查询）+ `audit/` 目录（可采集），同一条事件用同一个 `id` 对齐。
+
+| action | 触发 |
+| --- | --- |
+| `agent.create` / `agent.update` / `agent.delete` | Agent 管理 |
+| `session.update` / `session.delete` / `session.clear` | 会话改名、删除、清空历史 |
+| `gateway.start` | 服务启动（含版本与路由数量） |
+| `auth.*`（阶段 3） | 登录成功/失败、登出、API Key 变更 |
+
+查询（需鉴权；阶段 3 起限定管理员）：
+
+```text
+GET /audit?limit=100&offset=0&action=agent.delete&result=ok
+```
+
+```json
+[{"id":"9f2c...","ts":"2026-11-21T00:30:12.428+00:00","trace_id":"b4c8...",
+  "action":"agent.delete","result":"ok","reason":"","ip":"192.168.1.20",
+  "actor":{"type":"token","id":"legacy","name":"gateway-token"},
+  "target":{"type":"agent","id":"2b1c..."},"details":{}}]
+```
+
+审计写入是**旁路**：写库失败只记 ERROR，不会让业务请求失败；需要强合规时把 `audit` 日志采集到外部 WORM / SIEM，网关自身无法提供防篡改。审计文件保留期由 `GATEWAY_AUDIT_BACKUP_DAYS` 控制（默认 180 天）。
 
 ## 12. 基础版范围
 

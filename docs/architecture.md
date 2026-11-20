@@ -81,6 +81,7 @@
 | `gateway/proxy_health.py` | 反向代理的主动探活：周期探测、健康状态机、状态快照 | `HealthSettings`、`HealthMonitor` | 不碰转发路径，只改上游的 `healthy` 标记 |
 | `gateway/access_log.py` | 访问日志中间件：路径、参数摘要、脱敏、trace_id | `AccessLogMiddleware`、`redact` | 不改请求/响应内容 |
 | `gateway/logging_setup.py` | JSON 格式化、按类别/服务分文件、队列写盘、保留策略 | `LogSettings`、`setup_logging`、`DailyFileHandler` | 不决定"记什么"，只负责怎么记 |
+| `gateway/audit.py` | 审计双写：`audit_log` 表 + `audit/` 文件；查询投影 | `AuditTrail` | 不改业务结果（写失败只记 ERROR） |
 | `gateway/storage.py` | SQLite 表、迁移、索引、事务、查询 | `Store`、`MIGRATIONS` | 不 import `service`，不知道 HTTP |
 | `gateway/tickets.py` | 一次性票据的签发与核销 | `TicketStore`、`TICKET_SECONDS` | 不持久化、不加锁（单事件循环） |
 | `gateway/config.py` | 读环境变量 / `.env`，启动时校验 | `Settings`、`read_flag` | 不做运行时热更新 |
@@ -331,7 +332,13 @@ runs(id TEXT PK, session_id → sessions.id, request_id, input, status, reply,
 messages(id INTEGER PK AUTOINCREMENT, session_id → sessions.id, run_id → runs.id,
          role CHECK IN ('user','assistant'), content, created_at)
 CREATE INDEX messages_session ON messages(session_id, id)
+audit_log(id TEXT PK, ts, trace_id, actor_type, actor_id, actor_name,
+          action, target_type, target_id, result, reason, ip, details)   -- 迁移 v2
+CREATE INDEX audit_log_ts ON audit_log(ts)
+CREATE INDEX audit_log_action ON audit_log(action, ts)
 ```
+
+迁移版本：v1 是初始表结构，v2 增加 `audit_log`。追加写法见 [development.md](development.md#45-新增表或字段)。
 
 - 状态约束：`runs.status IN ('running','completed','failed','interrupted')`。
 - `UNIQUE(session_id, request_id)` 是"去重"在数据库层的最后一道保障。
@@ -515,7 +522,7 @@ httpx 的超时管"一段时间没有数据就断"，`asyncio.timeout` 管"这�
 
 日志由 `logging_setup.py` 统一接管：每条记录一行 JSON，经队列写到按类别/服务划分的文件，
 访问日志由 `access_log.py` 的纯 ASGI 中间件产生。详细字段与规则见
-[README 的"日志"一节](../README.md#11-日志)，这里记录实现层面的约定：
+[README 的"日志与审计"一节](../README.md#11-日志与审计)，这里记录实现层面的约定：
 
 | 位置 | 类别 | 记录内容 | 刻意不记录 |
 | --- | --- | --- | --- |
@@ -525,6 +532,7 @@ httpx 的超时管"一段时间没有数据就断"，`asyncio.timeout` 管"这�
 | `proxy.py` 冷却 | `proxy` | 前缀、上游、原因 | 请求内容 |
 | `proxy_health.py` | `proxy` | 判死/恢复、探活循环异常 | —— |
 | 被代理服务 | `service:<name>` | 该前缀的转发访问日志 | —— |
+| 审计 | `audit` | 变更事件（谁、做了什么、结果、来源 IP、trace_id） | 对话正文 |
 | uvicorn | `app` | 启动、关停、未预期错误 | —— |
 
 关键实现：

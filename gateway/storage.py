@@ -67,6 +67,27 @@ MIGRATIONS: list[tuple[int, tuple[str, ...]]] = [
         """,
         "CREATE INDEX IF NOT EXISTS messages_session ON messages(session_id, id)",
     )),
+    (2, (
+        """
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id TEXT PRIMARY KEY,
+            ts TEXT NOT NULL,
+            trace_id TEXT,
+            actor_type TEXT NOT NULL,
+            actor_id TEXT,
+            actor_name TEXT,
+            action TEXT NOT NULL,
+            target_type TEXT,
+            target_id TEXT,
+            result TEXT NOT NULL,
+            reason TEXT,
+            ip TEXT,
+            details TEXT
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS audit_log_ts ON audit_log(ts)",
+        "CREATE INDEX IF NOT EXISTS audit_log_action ON audit_log(action, ts)",
+    )),
 ]
 
 
@@ -281,6 +302,31 @@ class Store:
                 UPDATE runs SET status = ?, error_code = ?, error_message = ?, finished_at = ?
                 WHERE id = ? AND status = 'running'
             """, ("interrupted" if interrupted else "failed", error.code, error.message, now(), run_id))
+
+    # ------------------------------------------------------------ 审计
+
+    def append_audit(self, event: dict) -> None:
+        with self.connect() as db:
+            db.execute("""
+                INSERT INTO audit_log (id, ts, trace_id, actor_type, actor_id, actor_name,
+                                       action, target_type, target_id, result, reason, ip, details)
+                VALUES (:id, :ts, :trace_id, :actor_type, :actor_id, :actor_name,
+                        :action, :target_type, :target_id, :result, :reason, :ip, :details)
+            """, event)
+
+    def list_audit(self, limit: int = 100, offset: int = 0, *, action: str | None = None,
+                   result: str | None = None, actor_id: str | None = None) -> list[dict]:
+        query = "SELECT * FROM audit_log WHERE 1 = 1"
+        parameters: list[object] = []
+        for column, value in (("action", action), ("result", result), ("actor_id", actor_id)):
+            if value:
+                query += f" AND {column} = ?"
+                parameters.append(value)
+        query += " ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?"
+        parameters += [limit, offset]
+        with self.connect() as db:
+            rows = db.execute(query, parameters).fetchall()
+        return [dict(row) for row in rows]
 
     @staticmethod
     def _row(db: sqlite3.Connection, query: str, *parameters: object) -> sqlite3.Row | None:
