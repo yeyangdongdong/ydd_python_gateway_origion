@@ -516,6 +516,31 @@ chunked 请求可以绕过。
 
 ---
 
+## ADR-023 API Key 默认过期/白名单、CORS 与 CSRF、WS ping 显式配置
+
+**背景**：长期 Key 无默认过期、Key 泄露后来源不受限；外部 Web 前端无法直连；WS 心跳依赖隐式默认值。
+
+**决定**
+
+- 新建 Key 默认 **180 天**（`GATEWAY_API_KEY_DEFAULT_DAYS`），`0` 表示永不过期；
+  旧 Key 的 `expires_at=NULL` 行为不变；
+- Key 增加 `allowed_cidrs`（迁移 v6，空=不限制）；不匹配返回 **401**，
+  只记 WARN + `gateway_api_key_ip_rejections_total`，不写审计（避免被刷）；
+  IP 来源复用现有“只信任回环对端”的转发头逻辑；
+- CORS 使用精确 origin 白名单（拒绝 `*`），只对网关接口生效、代理前缀交给上游；
+  白名单 origin 同时放行 CSRF——跨站 Cookie 仍受 SameSite 限制，真正跨站建议用 API Key；
+- WS 心跳只做**显式配置**：`GATEWAY_WS_PING_INTERVAL/TIMEOUT` 传给 uvicorn 和代理上游；
+  不加应用层 ping/pong（协议层已覆盖，浏览器自动回 pong）。
+
+**后果**
+
+- 新 Key 默认会过期，180 天后需要重建；列表能用 `days_left` 提前发现。
+- 白名单会让配置错误直接表现为 401；排障时先看 `gateway_api_key_ip_rejections_total` 和 WARN 日志。
+- CORS 与 CSRF 共用同一份白名单，配置一处生效两处；不要把不可信站点加进去。
+- 心跳参数为 0 时关闭协议层检测，文档已标注风险。
+
+---
+
 ## 待定决策（已知但尚未做）
 
 | 主题 | 现状 | 若要做，建议 |

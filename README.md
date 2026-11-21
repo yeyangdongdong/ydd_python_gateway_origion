@@ -330,6 +330,10 @@ Agent、会话、消息和运行记录均保存在 SQLite。成功后，助手�
 | `GATEWAY_AUDIT_RETENTION_DAYS` | `180` | 审计表保留天数（启动时 + 每日清理） |
 | `GATEWAY_BACKUP_DIR` | `D:\Document\backup\logs` | 备份根目录 |
 | `GATEWAY_BACKUP_KEEP` | `14` | 保留最近多少个备份快照；`0` 表示不清理 |
+| `GATEWAY_API_KEY_DEFAULT_DAYS` | `180` | 新建 API Key 的默认有效天数；`0` 表示默认不过期 |
+| `GATEWAY_CORS_ORIGINS` | 空 | 允许跨源的精确 origin（逗号分隔）；空表示关闭 CORS |
+| `GATEWAY_WS_PING_INTERVAL` | `20` | WebSocket 协议层 ping 间隔秒数；`0` 表示关闭 |
+| `GATEWAY_WS_PING_TIMEOUT` | `20` | 等待 pong 的超时秒数；`0` 表示关闭 |
 
 `run.py` 默认只监听 `127.0.0.1:8000`。局域网访问请按「13. 部署：Caddy 前置 HTTPS」用 Caddy 终结 HTTPS；直接监听 `0.0.0.0` 且未启用 HTTPS 会被启动护栏拒绝。不要把 `.env` 或数据库提交到代码仓库。
 
@@ -653,8 +657,12 @@ $key.key   # 明文只返回这一次，请立即保存
 
 - 明文格式 `ydd_<id>_<secret>`，数据库只存 secret 的 SHA-256 与 8 位前缀；
 - scopes 可选：`sessions`（会话/消息/聊天/WS）、`agents`（Agent 管理）、`audit`（审计查询）、`proxy`（反向代理前缀）；
-- 可设过期时间、可随时撤销（`DELETE /api-keys/{id}`）；`last_used_at` 最多每分钟更新一次；
-- API Key **不能**管理 API Key，也不能读 `/audit`（除非同时给了 `audit` scope）；
+- **默认 180 天过期**（`GATEWAY_API_KEY_DEFAULT_DAYS`）；创建时 `expires_in_days=0` 表示永不过期，
+  列表会返回 `expires_at` 与 `days_left`；
+- **可按 Key 配置 IP 白名单**：`allowed_cidrs`（如 `["192.168.1.0/24"]`），空数组表示不限制；
+  不匹配返回 401，并计入 `gateway_api_key_ip_rejections_total`；
+- 可设过期时间、可随时撤销（`DELETE /api-keys/{id}`）；名字与白名单可用 `PATCH /api-keys/{id}` 修改；
+- `last_used_at` 最多每分钟更新一次；API Key **不能**管理 API Key，也不能读 `/audit`（除非同时给了 `audit` scope）；
 - 请求方式：`Authorization: Bearer ydd_...`。
 
 ### 角色与资源归属
@@ -679,6 +687,25 @@ $key.key   # 明文只返回这一次，请立即保存
 - 所有响应带 `X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: same-origin`；
 - **HTML 页面带严格 CSP**：`script-src 'self'; style-src 'self'; frame-ancestors 'none'` 等，
   脚本/样式已外置到 `/assets/`（白名单只暴露 4 个文件），页面里不再有内联 `<script>` / `<style>`。
+
+### 跨源访问（CORS）
+
+默认关闭；外部 Web 前端直连时配置精确 origin：
+
+```dotenv
+GATEWAY_CORS_ORIGINS=http://localhost:5173,https://tools.example.com
+```
+
+- 只对网关自己的接口生效，**代理前缀不加 CORS**（避免和上游响应头重复）；
+- 拒绝 `*`；启用 `allow_credentials=true`；
+- 配置的 origin 同时视为 **CSRF 可信来源**（Cookie 会话可跨源写请求）；
+- 跨站 Cookie 仍受 `SameSite=Lax` 限制；真正不同站点的前端建议用 API Key。
+
+### WebSocket 心跳
+
+- 协议层 ping/pong：`GATEWAY_WS_PING_INTERVAL` / `GATEWAY_WS_PING_TIMEOUT`（默认 20/20，`0` 关闭）；
+- 服务端与代理上游使用同一组值；浏览器会自动回 pong，页面无需业务层心跳；
+- 只有中间设备会过滤 WebSocket 控制帧时，才需要考虑应用层心跳（当前 Caddy 部署不需要）。
 
 ### 认证相关接口
 

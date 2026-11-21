@@ -48,7 +48,7 @@ class BackupTests(unittest.TestCase):
         with sqlite3.connect(snapshot / "database" / "gateway.sqlite3") as db:
             version = db.execute("SELECT version FROM schema_version").fetchone()[0]
         db.close()
-        self.assertEqual(version, 5)
+        self.assertEqual(version, 6)
 
         actions = [event["action"] for event in Store(self.db).list_audit()]
         self.assertIn("backup.create", actions)

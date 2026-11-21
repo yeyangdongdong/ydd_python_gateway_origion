@@ -31,8 +31,11 @@ def main() -> None:
     runtime = setup_logging(log_settings)
     try:
         # log_config=None：日志格式与去向完全由我们接管（含 access 日志的脱敏）。
+        # 0 表示关闭协议层 ping；传给 uvicorn 时换成 None。
         uvicorn.run(app, host=args.host, port=args.port, workers=1,
-                    ws_max_size=65536, timeout_graceful_shutdown=10, log_config=None)
+                    ws_max_size=65536, timeout_graceful_shutdown=10, log_config=None,
+                    ws_ping_interval=settings.ws_ping_interval or None,
+                    ws_ping_timeout=settings.ws_ping_timeout or None)
     finally:
         runtime.stop()
 

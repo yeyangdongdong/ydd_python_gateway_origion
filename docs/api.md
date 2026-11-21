@@ -361,8 +361,9 @@ WS    /finance/live         →  ws://127.0.0.1:9001/live
 | POST | `/login` | `application/x-www-form-urlencoded`：`username`、`password`、可选 `next`；成功 303 + `Set-Cookie: ydd_session`，失败 303 到 `/login?error=invalid|locked` |
 | POST | `/logout` | 吊销当前会话并清 Cookie（需登录；Cookie 认证时校验 CSRF 来源） |
 | GET | `/auth/status` | `{"auth_mode","authenticated","user"}`，无需登录 |
-| GET | `/api-keys` | 列出 API Key（管理员；不含明文） |
-| POST | `/api-keys` | `{"name","scopes","expires_in_days"}` → 返回一次性明文（管理员） |
+| GET | `/api-keys` | 列出 API Key（管理员；不含明文，含 `days_left`、`allowed_cidrs`） |
+| POST | `/api-keys` | `{"name","scopes","expires_in_days","allowed_cidrs"}` → 一次性明文；默认 180 天，`0` 表示永不过期 |
+| PATCH | `/api-keys/{key_id}` | `{"name"?, "allowed_cidrs"?}`（管理员；scopes 需重建） |
 | DELETE | `/api-keys/{key_id}` | 撤销（管理员）；不存在或已撤销 → 404 |
 | GET | `/users` | 用户列表（管理员） |
 | POST | `/users` | `{"username","password","role"}`（管理员；密码策略见 README） |

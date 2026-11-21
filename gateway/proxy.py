@@ -289,9 +289,12 @@ def _error_event(status: int, code: str, message: str) -> dict:
 class Proxy:
     """持有上游客户端，负责单次转发的全部细节（HTTP 与 WebSocket）。"""
 
-    def __init__(self, routes: list[ProxyRoute], timeout: float):
+    def __init__(self, routes: list[ProxyRoute], timeout: float, *,
+                 ping_interval: float = 20.0, ping_timeout: float = 20.0):
         self.routes = routes
         self.timeout = timeout
+        self.ping_interval = ping_interval
+        self.ping_timeout = ping_timeout
         # 与模型调用同理：默认不读取系统代理，否则本机上游会被代理拦截。
         self.client = httpx.AsyncClient(timeout=timeout, trust_env=False)
         self.health = HealthMonitor(routes, self.client)
@@ -386,9 +389,12 @@ class Proxy:
             url = route.upstream_ws_url(upstream, remainder, query)
             try:
                 # 先连上游再 accept：失败还能换下一个，accept 之后就只能将错就错。
-                connection = await connect(url, additional_headers=headers or None,
-                                           subprotocols=subprotocols or None,
-                                           open_timeout=self.timeout, max_size=None)
+                connection = await connect(
+                    url, additional_headers=headers or None,
+                    subprotocols=subprotocols or None,
+                    open_timeout=self.timeout, max_size=None,
+                    ping_interval=self.ping_interval or None,
+                    ping_timeout=self.ping_timeout or None)
                 break
             except (TimeoutError, asyncio.TimeoutError):
                 last_status = 504

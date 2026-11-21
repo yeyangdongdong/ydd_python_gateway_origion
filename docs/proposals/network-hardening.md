@@ -1,6 +1,6 @@
 # 提案：API Key 过期/IP 白名单、CORS、WebSocket 心跳
 
-- **状态**：待评审（未开发）
+- **状态**：**已实现**（四项，见实施记录）
 - **范围**：三项互相独立，可分别决定做/不做
 - **关联**：[api.md](../api.md)、[architecture.md](../architecture.md)、ADR-017（API Key）、ADR-022（CSP/请求体）
 
@@ -233,8 +233,15 @@ CORS 与 IP 白名单都涉及“谁能访问”的边界，建议一起评审�
 
 ## 6. 待你决定
 
-1. API Key 默认过期天数：90 / 180 / 其他？`0` 表示永不过期是否接受？
-2. IP 白名单不匹配返回 401（推荐）还是 403？拒绝是否写审计？
-3. CORS 是否采用“白名单 origin 同时放行 CSRF”（推荐 A），还是只支持 Bearer？
-4. WS 心跳是否只做显式配置（推荐），还是要应用层 ping/pong？
-5. 三项是全部开发，还是先挑其中几项？
+（评审后已定：默认 180 天；IP 不匹配 401；CORS origin 同时放行 CSRF；WS 只做显式配置；四项全做。）
+
+## 7. 实施记录
+
+| 项 | 提交 | 结果 |
+| --- | --- | --- |
+| API Key 默认过期（180 天） | `4b1ea9f` | 不传按默认；`0` 永不过期；列表返回 `days_left` |
+| CORS（精确 origin + CSRF 联动） | `3ad1d40` | 默认关闭；代理前缀不加 CORS；配置 origin 同时放行 CSRF |
+| API Key IP 白名单 | `7d1d94c` | 迁移 v6；`allowed_cidrs`；`PATCH /api-keys/{id}`；401 + 指标 |
+| WS 心跳显式配置 | 随本文档提交 | `GATEWAY_WS_PING_INTERVAL/TIMEOUT`，uvicorn 与代理上游共用 |
+
+全量测试从 120 增至 132，全部通过。

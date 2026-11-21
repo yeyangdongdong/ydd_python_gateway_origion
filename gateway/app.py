@@ -89,7 +89,9 @@ def create_app(settings: Settings | None = None,
 
         provider = ModelProvider(settings)
         ctx.chat = ChatService(ctx.store, provider, settings)
-        ctx.proxy = Proxy(ctx.routes, settings.proxy_timeout) if ctx.routes else None
+        ctx.proxy = Proxy(ctx.routes, settings.proxy_timeout,
+                          ping_interval=settings.ws_ping_interval,
+                          ping_timeout=settings.ws_ping_timeout) if ctx.routes else None
         # 兼容旧测试/外部代码对 app.state.chat / app.state.proxy 的读取。
         app.state.chat, app.state.proxy = ctx.chat, ctx.proxy
         if ctx.proxy is not None:

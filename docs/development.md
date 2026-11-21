@@ -42,7 +42,7 @@ Copy-Item .env.example .env
 | 顺序 | 文件 | 行数 | 读它是为了知道 |
 | --- | --- | --- | --- |
 | 1 | `run.py` | 41 | 入口、监听地址、日志初始化、对外监听保护 |
-| 2 | `gateway/app.py` | 161 | 装配：AppContext、lifespan、中间件、异常处理、路由、静态资源白名单 |
+| 2 | `gateway/app.py` | 167 | 装配：AppContext、lifespan、中间件（含 CORS）、异常处理、路由、静态资源 |
 | 3 | `gateway/container.py` | 26 | `AppContext` 里有哪些依赖 |
 | 4 | `gateway/api/deps.py` | 255 | 鉴权、CSRF、viewer 只读、API Key scope、归属检查、审计包装 |
 | 5 | `gateway/api/models.py` | 78 | 请求/响应模型与页面路径 |
@@ -51,7 +51,7 @@ Copy-Item .env.example .env
 | 8 | `gateway/api/agents.py` | 64 | Agent 管理（owner 过滤） |
 | 9 | `gateway/api/sessions.py` | 93 | 会话/消息/运行/票据 |
 | 10 | `gateway/api/chat.py` | 136 | HTTP 聊天 + WebSocket 会话 |
-| 11 | `gateway/api/admin.py` | 90 | API Key、审计查询与 `/metrics` |
+| 11 | `gateway/api/admin.py` | 148 | API Key（过期/IP 白名单/PATCH）、审计查询与 `/metrics` |
 | 12 | `gateway/proxy_routes.py` | 90 | 代理状态/票据 + 动态转发注册 |
 | 13 | `gateway/service.py` | 103 | 唯一的业务编排：排队 → 取历史 → 裁剪 → 调模型 → 落库 → 去重 |
 | 14 | `gateway/context.py` | 135 | token 估算与预算裁剪（纯函数，最容易改） |
@@ -65,16 +65,16 @@ Copy-Item .env.example .env
 | 22 | `gateway/audit.py` | 83 | 审计双写（DB + 文件）与查询投影 |
 | 23 | `gateway/maintenance.py` | 41 | 审计保留期清理与每日巡检 |
 | 24 | `gateway/backup.py` | 232 | 备份命令：日志按服务 + 数据库快照 + 旧快照清理 |
-| 25 | `gateway/limits.py` | 116 | 每用户并发/速率限制、请求体上限、安全响应头 |
+| 25 | `gateway/limits.py` | 187 | 每用户并发/速率限制、请求体上限、安全头/CSP、CORS |
 | 26 | `gateway/metrics.py` | 120 | HTTP/WS/登录/审计指标与 Prometheus 文本 |
 | 27 | `gateway/net.py` | 16 | 只信任回环对端的转发 IP 还原 |
-| 28 | `gateway/proxy.py` | 534 | 反向代理：路由表校验、加权轮询与冷却、HTTP 流式转发、WS 桥接、身份注入 |
+| 28 | `gateway/proxy.py` | 541 | 反向代理：路由表校验、加权轮询与冷却、HTTP 流式转发、WS 桥接（含 ping）、身份注入 |
 | 29 | `gateway/proxy_health.py` | 178 | 主动探活：周期探测、健康状态机、状态快照 |
-| 30 | `gateway/config.py` | 165 | 配置项与启动校验 |
+| 30 | `gateway/config.py` | 193 | 配置项与启动校验（含 CORS/Key 过期/WS ping） |
 | 31 | `web/chat.html` + `chat.css`/`chat.js` | 42 + 57/230 | 聊天页（外部 CSS/JS，严格 CSP） |
 | 32 | `web/login.html` + `login.css`/`login.js` | 24 + 33/18 | 登录页（外部 CSS/JS，严格 CSP） |
 
-合计约 4,550 行 Python（含注释与文档字符串）+ 约 400 行页面，不含测试。
+合计约 4,650 行 Python（含注释与文档字符串）+ 约 400 行页面，不含测试。
 行数会漂移，用它判断"该先读哪个"，不要当作精确指标。
 
 不熟悉的状态机、错误分层、并发模型，先看 [architecture.md](architecture.md)。
@@ -85,7 +85,7 @@ Copy-Item .env.example .env
 
 `tests/test_gateway.py`（约 1,080 行，55 个用例）覆盖业务链路，`tests/test_logging.py`（约 170 行，8 个用例）覆盖日志，
 `tests/test_audit.py`（约 100 行，5 个用例）覆盖审计，`tests/test_auth.py`（约 180 行，10 个用例）覆盖本地认证，
-`tests/test_api_keys.py`（约 140 行，5 个用例）覆盖 API Key，`tests/test_ownership.py`（约 130 行，5 个用例）覆盖归属与角色，`tests/test_users.py`（约 140 行，7 个用例）覆盖用户管理、密码策略与登录限速，`tests/test_limits.py`（约 110 行，8 个用例）覆盖限流、安全头、CSP、静态资源与 chunked 限制，`tests/test_proxy_identity.py`（约 70 行，1 个用例）覆盖代理身份签名，`tests/test_routes.py`（约 45 行，1 个用例）检查路由清单与重复注册，`tests/test_maintenance.py`（约 70 行，3 个用例）覆盖审计清理，`tests/test_backup.py`（约 70 行，3 个用例）覆盖备份与快照保留，`tests/test_metrics.py`（约 80 行，3 个用例）覆盖指标与鉴权，`tests/test_storage_pool.py`（约 60 行，3 个用例）覆盖连接复用。原则是**从真实入口验证**：
+`tests/test_api_keys.py`（约 140 行，5 个用例）覆盖 API Key，`tests/test_ownership.py`（约 130 行，5 个用例）覆盖归属与角色，`tests/test_users.py`（约 140 行，7 个用例）覆盖用户管理、密码策略与登录限速，`tests/test_limits.py`（约 110 行，8 个用例）覆盖限流、安全头、CSP、静态资源与 chunked 限制，`tests/test_proxy_identity.py`（约 70 行，1 个用例）覆盖代理身份签名，`tests/test_routes.py`（约 45 行，1 个用例）检查路由清单与重复注册，`tests/test_maintenance.py`（约 70 行，3 个用例）覆盖审计清理，`tests/test_backup.py`（约 70 行，3 个用例）覆盖备份与快照保留，`tests/test_metrics.py`（约 80 行，3 个用例）覆盖指标与鉴权，`tests/test_storage_pool.py`（约 60 行，3 个用例）覆盖连接复用，`tests/test_cors.py`（约 75 行，4 个用例）覆盖 CORS/CSRF，`tests/test_ws_ping.py`（约 30 行，3 个用例）覆盖 WS ping 配置。原则是**从真实入口验证**：
 
 - 用 `fastapi.testclient.TestClient` 走真实的 HTTP 与 WebSocket 路径，不直接调用 `ChatService`；
 - 模型服务用本地 `ThreadingHTTPServer` 替身（`ModelStub`），反向代理则用 `EchoStub`（HTTP）与
@@ -141,6 +141,9 @@ Copy-Item .env.example .env
 | 备份 | `test_backup_copies_logs_by_service_and_database`、`test_retention_keeps_latest_snapshots`、`test_dry_run_writes_nothing` |
 | 连接复用 | `test_reuses_the_same_connection`、`test_connect_after_close_creates_new_connection`、`test_concurrent_reads_are_safe` |
 | 指标 | `test_http_counters_and_auth`、`test_metrics_requires_admin_or_metrics_scope`、`test_ws_gauge` |
+| API Key 过期/白名单 | `test_default_expiry_and_explicit_never`、`test_ip_allowlist_accepts_and_rejects`、`test_invalid_cidr_is_rejected`、`test_ip_allowed_*` |
+| CORS | `test_preflight_and_actual_request`、`test_csrf_accepts_configured_origin`、`test_cors_is_off_by_default`、`test_invalid_origins_are_rejected` |
+| WS ping 配置 | `test_defaults`、`test_custom_and_zero`、`test_negative_values_are_rejected` |
 | 用户管理与密码/限速 | `test_create_update_and_reset_password`、`test_last_admin_cannot_be_disabled`、`test_disabled_user_cannot_login_and_sessions_are_revoked`、`test_member_cannot_manage_users`、`test_self_password_change_revokes_other_sessions`、`test_password_policy_is_shared`、`test_ip_level_limiter_stops_username_spraying` |
 | 请求体/聊天限流/安全头 | `test_security_headers_are_added`、`test_html_pages_get_strict_csp`、`test_static_assets_are_served_from_whitelist`、`test_chunked_body_over_limit_returns_413`、`test_body_limit_returns_413`、`test_chat_rate_limit_returns_429`、`test_concurrency_limit`、`test_per_minute_limit` |
 | 代理身份注入 | `test_signed_identity_and_spoof_stripping` |
@@ -289,7 +292,7 @@ MIGRATIONS: list[tuple[int, tuple[str, ...]]] = [
 
 ## 6. 提交前检查清单
 
-- [ ] `python -m unittest discover -s tests` 全绿（当前 120 个）
+- [ ] `python -m unittest discover -s tests` 全绿（当前 132 个）
 - [ ] `python -m compileall -q gateway tests examples run.py` 通过
 - [ ] 改了接口/事件/错误码 → 同步 `docs/api.md`
 - [ ] 改了行为或配置 → 同步 `README.md` 与 `.env.example`
