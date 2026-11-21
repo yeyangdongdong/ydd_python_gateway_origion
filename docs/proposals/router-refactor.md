@@ -1,6 +1,6 @@
 # 提案：拆分路由 + 归属检查下沉（P1-7）
 
-- **状态**：待实施（设计评审中）
+- **状态**：**已实现**（A `8e1e012`、B `8a33fbc`、C 本次提交）
 - **目标版本**：下一轮重构
 - **预计工作量**：1.5–2 天（含测试与文档），建议 3 笔提交
 - **关联**：[architecture.md](../architecture.md)、[development.md](../development.md)、ADR-018（归属用 404）
@@ -226,8 +226,19 @@ async def stream(self, session_id: str, content: str, request_id: str | None,
 | C | 清理、路由清单测试、文档 | 0.5 天 |
 | 合计 | | **1.5–2 天** |
 
-## 9. 待确认
+## 9. 实施记录
 
-1. 包名用 `gateway/api/`（推荐）还是 `gateway/routers/`？
-2. `owner_id=None` 表示“管理员/API Key 不限制”，是否接受这个语义？
-3. 是否顺手把 `net.py`、`limits.py` 收进 `gateway/security/`？**建议不折腾**，它们已经在独立文件里，移动只会增加 diff。
+| 步骤 | 提交 | 结果 |
+| --- | --- | --- |
+| A 骨架搬迁 | `8e1e012` | `app.py` 930 → 122 行；新增 `container.py`、`api/`（7 个模块）、`proxy_routes.py`；103 测试全绿 |
+| B 归属下沉 | `8a33fbc` | 新增 `Store.get_owned_session`；`ChatService.stream(..., *, owner_id)`；HTTP/WS 全部传 `owner_scope`；新增直接调用 service 的归属测试；104 测试全绿 |
+| C 收尾 | 本次 | 路由清单测试、文档与 ADR-019；105 测试全绿 |
+
+最终结构：`gateway/api/deps.py`（255 行）是唯一鉴权/归属入口；
+`app.py`（122 行）只做装配；行为与 URL 未变。
+
+## 10. 决定（评审后）
+
+1. 包名采用 `gateway/api/`；
+2. `owner_id=None` 表示管理员 / 服务级 API Key 不限制；
+3. `net.py`、`limits.py` 保持原位，不额外收进 `security/`。

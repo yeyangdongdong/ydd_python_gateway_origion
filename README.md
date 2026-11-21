@@ -328,7 +328,7 @@ Agent、会话、消息和运行记录均保存在 SQLite。成功后，助手�
 | `GATEWAY_CHAT_CONCURRENCY` | `3` | 每个用户同时进行的聊天轮数上限 |
 | `GATEWAY_CHAT_PER_MINUTE` | `60` | 每个用户每分钟聊天请求上限 |
 
-`run.py` 默认只监听 `127.0.0.1:8000`。需要局域网访问时，先设置非空 `GATEWAY_TOKEN`，再运行 `python run.py --host 0.0.0.0`；跨不可信网络应通过 HTTPS/WSS 反向代理或受保护的隧道访问。不要把 `.env` 或数据库提交到代码仓库。
+`run.py` 默认只监听 `127.0.0.1:8000`。局域网访问请按「13. 部署：Caddy 前置 HTTPS」用 Caddy 终结 HTTPS；直接监听 `0.0.0.0` 且未启用 HTTPS 会被启动护栏拒绝。不要把 `.env` 或数据库提交到代码仓库。
 
 ## 9. 阅读代码
 
@@ -336,7 +336,10 @@ Agent、会话、消息和运行记录均保存在 SQLite。成功后，助手�
 ydd_python_gateway_origion/
 ├── run.py                      # 启动入口和监听地址
 ├── gateway/
-│   ├── app.py                  # HTTP、WebSocket、票据、输入校验和鉴权
+│   ├── app.py                  # 装配：上下文、生命周期、中间件、异常处理、注册路由
+│   ├── container.py            # AppContext（依赖集合）
+│   ├── api/                    # 按资源拆分的路由：deps/auth/users/agents/sessions/chat/admin
+│   ├── proxy_routes.py         # 代理状态、票据与动态转发注册
 │   ├── service.py              # 排队、历史、裁剪、模型调用、保存和去重
 │   ├── context.py              # token 估算和按预算裁剪历史
 │   ├── provider.py             # 演示模型、兼容模型和 SSE 解析

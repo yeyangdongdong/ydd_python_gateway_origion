@@ -53,7 +53,8 @@
                 HTTP 客户端            WebSocket 客户端          浏览器页面
                      │                        │                     │
 ┌────────────────────▼────────────────────────▼─────────────────────▼──────────┐
-│ app.py          网络边界：路由、鉴权（Bearer / ticket）、输入校验、错误→状态码  │
+│ app.py          装配：lifespan、中间件、异常处理、注册路由                      │
+│ api/            网络边界：路由、鉴权（Bearer / Cookie / ticket）、输入校验      │
 ├───────────────────────────────────────────────────────────────────────────────┤
 │ service.py      业务编排：会话排队、取历史、预算裁剪、调用模型、落库、请求去重  │
 │   ├── context.py    纯函数：token 估算与按预算裁剪（无 I/O）                     │
@@ -66,19 +67,28 @@
 └───────────────────────────────────────────────────────────────────────────────┘
 ```
 
-依赖只向下：`app → service → {context, provider, tickets} + storage`。
+依赖只向下：`app → api → deps → service → {context, provider, tickets} + storage`。
 `context.py` 和 `tickets.py` 不碰网络与数据库，所以能纯函数式地单测。
+归属检查只有一个实现：`Store.get_owned_session`（`owner_id=None` 表示管理员/服务级身份不限制）。
 
 ### 3.2 各模块职责
 
 | 文件 | 职责 | 关键符号 | 不做的事 |
 | --- | --- | --- | --- |
-| `gateway/app.py` | 注册路由、鉴权、Pydantic 校验、把 `GatewayError` 映射为 JSON | `create_app`、`require_auth`、`accepts_ticket`、`chat`、`stream` | 不写业务逻辑、不直接拼 SQL |
-| `gateway/service.py` | 唯一的编排入口，HTTP 与 WS 共用 | `ChatService.stream`（异步生成器） | 不解析 SSE、不拼 SQL |
+| `gateway/app.py` | 装配：创建 `AppContext`、lifespan、中间件、异常处理、注册路由 | `create_app` | 不写业务逻辑、不拼 SQL |
+| `gateway/container.py` | 一次装配好的依赖集合 | `AppContext` | 不 import `api/` |
+| `gateway/api/deps.py` | 鉴权、CSRF、viewer 只读、API Key scope、归属检查、审计包装 | `require_auth`、`owned_session`、`owner_scope`、`websocket_principal` | 不拼业务 SQL |
+| `gateway/api/*.py` | 按资源拆分的路由：`auth/users/agents/sessions/chat/admin` | `build_xxx_router(ctx)` | 不直接做鉴权判断（交给 deps） |
+| `gateway/proxy_routes.py` | 代理状态/票据 + 按 `routes.json` 动态注册 HTTP/WS 转发 | `build_proxy_router`、`register_forwarders` | 不实现转发细节（在 proxy.py） |
+| `gateway/service.py` | 唯一的编排入口，HTTP 与 WS 共用；`owner_id` 必填 | `ChatService.stream`（异步生成器） | 不解析 SSE、不拼 SQL |
 | `gateway/context.py` | token 估算、按预算组装消息、超限报 413 | `estimate_tokens`、`build_context`、`PreparedContext` | 无 I/O、无状态 |
 | `gateway/provider.py` | demo 回显、兼容 Chat Completions 的流式调用 | `ModelProvider.stream`、`_sse_data` | 不写库、不改历史 |
 | `gateway/proxy.py` | 可选的反向代理：路由表、加权轮询、HTTP 流式转发、WebSocket 双向桥接 | `ProxyRoute`、`Proxy`、`load_routes` | 不解析上游语义、不做负载均衡以外的调度 |
 | `gateway/proxy_health.py` | 反向代理的主动探活：周期探测、健康状态机、状态快照 | `HealthSettings`、`HealthMonitor` | 不碰转发路径，只改上游的 `healthy` 标记 |
+| `gateway/auth.py` | 密码哈希、会话 token、登录限速、API Key、密码策略 | `hash_password`、`LoginLimiter`、`validate_password` | 不读 HTTP、不碰 Cookie |
+| `gateway/admin.py` | 命令行管理用户 | `main`、`create-user` / `set-role` / `disable-user` | 不启动服务 |
+| `gateway/limits.py` | 每用户聊天限流、请求体上限、安全响应头 | `UserLimiter`、`BodyLimitMiddleware`、`SecurityHeadersMiddleware` | 不做认证 |
+| `gateway/net.py` | 只信任回环对端的 `X-Forwarded-For` / `X-Real-IP` | `forwarded_ip` | 不做 IP 封禁 |
 | `gateway/access_log.py` | 访问日志中间件：路径、参数摘要、脱敏、trace_id | `AccessLogMiddleware`、`redact` | 不改请求/响应内容 |
 | `gateway/logging_setup.py` | JSON 格式化、按类别/服务分文件、队列写盘、保留策略 | `LogSettings`、`setup_logging`、`DailyFileHandler` | 不决定"记什么"，只负责怎么记 |
 | `gateway/audit.py` | 审计双写：`audit_log` 表 + `audit/` 文件；查询投影 | `AuditTrail` | 不改业务结果（写失败只记 ERROR） |

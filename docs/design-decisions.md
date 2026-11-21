@@ -425,6 +425,28 @@ Key 不能管理 Key；管理员可撤销；`last_used_at` 最多每分钟更新
 
 ---
 
+## ADR-019 按资源拆 router，归属检查只留一个实现
+
+**背景**：`app.py` 涨到 930 行；归属检查只在 HTTP 层，`ChatService` 不知道 owner，
+新入口（OpenAI 兼容、脚本）可能绕过隔离。
+
+**决定**
+
+- `app.py` 只做装配（上下文、lifespan、中间件、异常、路由注册），业务路由放 `gateway/api/`；
+- 用 `AppContext` 显式持有 store/audit/tickets/limiters/routes/chat/proxy，不用全局变量；
+- `api/deps.py` 是唯一鉴权/归属入口；归属检查收敛到 `Store.get_owned_session`；
+- `ChatService.stream` 的 `owner_id` 是必填关键字参数，忘记传会直接 TypeError；
+- 保留 `app.state.chat` / `app.state.proxy` 兼容别名，已有测试与外部脚本不用改。
+
+**后果**
+
+- URL、状态码、错误码、审计/日志字段全部不变；104 个既有断言不改即通过。
+- 新增入口必须自己传 `owner_id`，但“传错”会在 service 内变成 404，而不是静默越权。
+- 多了一层 `api/` 包，读代码时先看 `app.py` 的装配再看对应资源模块；`deps.py` 是重点审查对象。
+- 没有引入 DI 框架；router 仍是普通 FastAPI 写法，只是用工厂函数拿到 `AppContext`。
+
+---
+
 ## 待定决策（已知但尚未做）
 
 | 主题 | 现状 | 若要做，建议 |

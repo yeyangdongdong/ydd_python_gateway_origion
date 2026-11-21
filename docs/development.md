@@ -41,25 +41,36 @@ Copy-Item .env.example .env
 
 | 顺序 | 文件 | 行数 | 读它是为了知道 |
 | --- | --- | --- | --- |
-| 1 | `run.py` | 37 | 入口、监听地址、日志初始化、对外监听保护 |
-| 2 | `gateway/app.py` | 920 | 路由、鉴权（token/会话/API Key/CSRF）、归属检查、用户管理、错误映射 |
-| 3 | `gateway/service.py` | 100 | 唯一的业务编排：排队 → 取历史 → 裁剪 → 调模型 → 落库 → 去重 |
-| 4 | `gateway/context.py` | 135 | token 估算与预算裁剪（纯函数，最容易改） |
-| 5 | `gateway/provider.py` | 122 | demo 回显与 SSE 解析、上游错误如何归一 |
-| 6 | `gateway/storage.py` | 554 | 迁移（审计/账号/API Key/归属）、表结构、事务边界、查询 |
-| 7 | `gateway/tickets.py` | 62 | 一次性票据（30 秒、单次、绑定资源） |
-| 8 | `gateway/access_log.py` | 198 | 访问日志中间件、参数摘要与脱敏 |
-| 9 | `gateway/logging_setup.py` | 303 | JSON 格式化、按类别/服务分文件、队列写盘、保留策略 |
-| 10 | `gateway/audit.py` | 83 | 审计双写（DB + 文件）与查询投影 |
-| 11 | `gateway/auth.py` | 173 | scrypt 密码、会话 token、登录限速、API Key、密码策略、Principal |
-| 12 | `gateway/admin.py` | 123 | 命令行建用户/改角色/启停用/重置密码 |
-| 13 | `gateway/proxy.py` | 487 | 反向代理：路由表校验、加权轮询与冷却、HTTP 流式转发、WS 桥接 |
-| 14 | `gateway/proxy_health.py` | 178 | 主动探活：周期探测、健康状态机、状态快照 |
-| 15 | `gateway/config.py` | 165 | 配置项与启动校验 |
-| 16 | `gateway/limits.py` | 110 | 每用户并发/速率限制、请求体上限、安全响应头 |
-| 17 | `web/chat.html` / `web/login.html` | 330 / 约 100 | 聊天页与登录页（均无外部依赖） |
+| 1 | `run.py` | 41 | 入口、监听地址、日志初始化、对外监听保护 |
+| 2 | `gateway/app.py` | 122 | 装配：AppContext、lifespan、中间件、异常处理、注册路由 |
+| 3 | `gateway/container.py` | 26 | `AppContext` 里有哪些依赖 |
+| 4 | `gateway/api/deps.py` | 255 | 鉴权、CSRF、viewer 只读、API Key scope、归属检查、审计包装 |
+| 5 | `gateway/api/models.py` | 78 | 请求/响应模型与页面路径 |
+| 6 | `gateway/api/auth.py` | 144 | 登录/登出、认证状态、自助改密 |
+| 7 | `gateway/api/users.py` | 86 | 用户管理（最后一个管理员保护） |
+| 8 | `gateway/api/agents.py` | 64 | Agent 管理（owner 过滤） |
+| 9 | `gateway/api/sessions.py` | 93 | 会话/消息/运行/票据 |
+| 10 | `gateway/api/chat.py` | 136 | HTTP 聊天 + WebSocket 会话 |
+| 11 | `gateway/api/admin.py` | 78 | API Key 与审计查询 |
+| 12 | `gateway/proxy_routes.py` | 90 | 代理状态/票据 + 动态转发注册 |
+| 13 | `gateway/service.py` | 103 | 唯一的业务编排：排队 → 取历史 → 裁剪 → 调模型 → 落库 → 去重 |
+| 14 | `gateway/context.py` | 135 | token 估算与预算裁剪（纯函数，最容易改） |
+| 15 | `gateway/provider.py` | 122 | demo 回显与 SSE 解析、上游错误如何归一 |
+| 16 | `gateway/storage.py` | 564 | 迁移、表结构、事务边界、`get_owned_session`、查询 |
+| 17 | `gateway/tickets.py` | 62 | 一次性票据（30 秒、单次、绑定资源） |
+| 18 | `gateway/auth.py` | 173 | scrypt 密码、会话 token、登录限速、API Key、密码策略、Principal |
+| 19 | `gateway/admin.py` | 123 | 命令行建用户/改角色/启停用/重置密码 |
+| 20 | `gateway/access_log.py` | 211 | 访问日志中间件、参数摘要与脱敏 |
+| 21 | `gateway/logging_setup.py` | 303 | JSON 格式化、按类别/服务分文件、队列写盘、保留策略 |
+| 22 | `gateway/audit.py` | 83 | 审计双写（DB + 文件）与查询投影 |
+| 23 | `gateway/limits.py` | 116 | 每用户并发/速率限制、请求体上限、安全响应头 |
+| 24 | `gateway/net.py` | 16 | 只信任回环对端的转发 IP 还原 |
+| 25 | `gateway/proxy.py` | 534 | 反向代理：路由表校验、加权轮询与冷却、HTTP 流式转发、WS 桥接、身份注入 |
+| 26 | `gateway/proxy_health.py` | 178 | 主动探活：周期探测、健康状态机、状态快照 |
+| 27 | `gateway/config.py` | 152 | 配置项与启动校验 |
+| 28 | `web/chat.html` / `web/login.html` | 330 / 约 100 | 聊天页与登录页（均无外部依赖） |
 
-合计约 3,900 行 Python（含注释与文档字符串）+ 约 430 行页面，不含测试。
+合计约 4,100 行 Python（含注释与文档字符串）+ 约 430 行页面，不含测试。
 行数会漂移，用它判断"该先读哪个"，不要当作精确指标。
 
 不熟悉的状态机、错误分层、并发模型，先看 [architecture.md](architecture.md)。
@@ -70,7 +81,7 @@ Copy-Item .env.example .env
 
 `tests/test_gateway.py`（约 1,080 行，55 个用例）覆盖业务链路，`tests/test_logging.py`（约 170 行，8 个用例）覆盖日志，
 `tests/test_audit.py`（约 100 行，5 个用例）覆盖审计，`tests/test_auth.py`（约 180 行，10 个用例）覆盖本地认证，
-`tests/test_api_keys.py`（约 140 行，5 个用例）覆盖 API Key，`tests/test_ownership.py`（约 130 行，5 个用例）覆盖归属与角色，`tests/test_users.py`（约 140 行，7 个用例）覆盖用户管理、密码策略与登录限速，`tests/test_limits.py`（约 80 行，5 个用例）覆盖限流与安全头，`tests/test_proxy_identity.py`（约 70 行，1 个用例）覆盖代理身份签名。原则是**从真实入口验证**：
+`tests/test_api_keys.py`（约 140 行，5 个用例）覆盖 API Key，`tests/test_ownership.py`（约 130 行，5 个用例）覆盖归属与角色，`tests/test_users.py`（约 140 行，7 个用例）覆盖用户管理、密码策略与登录限速，`tests/test_limits.py`（约 80 行，5 个用例）覆盖限流与安全头，`tests/test_proxy_identity.py`（约 70 行，1 个用例）覆盖代理身份签名，`tests/test_routes.py`（约 45 行，1 个用例）检查路由清单与重复注册。原则是**从真实入口验证**：
 
 - 用 `fastapi.testclient.TestClient` 走真实的 HTTP 与 WebSocket 路径，不直接调用 `ChatService`；
 - 模型服务用本地 `ThreadingHTTPServer` 替身（`ModelStub`），反向代理则用 `EchoStub`（HTTP）与
@@ -120,7 +131,8 @@ Copy-Item .env.example .env
 | 审计 | `test_agent_mutations_are_audited`、`test_session_clear_and_delete_are_audited`、`test_startup_event_is_recorded`、`test_audit_query_requires_token_and_pages`、`test_audit_failure_does_not_break_business` |
 | 本地认证 | `test_hash_and_verify`、`test_login_logout_and_cookie_auth`、`test_wrong_password_is_audited_and_rate_limited`、`test_audit_failure_records_login`、`test_csrf_rejects_cross_site_mutation`、`test_revoked_and_expired_sessions_are_rejected`、`test_legacy_token_still_works_in_local_mode`、`test_websocket_accepts_session_cookie`、`test_next_redirect_is_restricted`、`test_login_page_is_disabled_in_legacy_mode` |
 | API Key | `test_create_list_and_audit`、`test_scope_limits_access`、`test_revoked_and_expired_keys_are_rejected`、`test_member_cannot_manage_keys`、`test_websocket_accepts_api_key` |
-| 归属与角色 | `test_members_only_see_their_own_sessions`、`test_agent_ownership_and_default_agent`、`test_viewer_is_read_only`、`test_websocket_rejects_other_members_session`、`test_proxy_required_scope` |
+| 归属与角色 | `test_members_only_see_their_own_sessions`、`test_agent_ownership_and_default_agent`、`test_viewer_is_read_only`、`test_websocket_rejects_other_members_session`、`test_chat_service_enforces_owner_when_called_directly`、`test_proxy_required_scope` |
+| 路由清单 | `test_key_paths_are_registered_once` |
 | 用户管理与密码/限速 | `test_create_update_and_reset_password`、`test_last_admin_cannot_be_disabled`、`test_disabled_user_cannot_login_and_sessions_are_revoked`、`test_member_cannot_manage_users`、`test_self_password_change_revokes_other_sessions`、`test_password_policy_is_shared`、`test_ip_level_limiter_stops_username_spraying` |
 | 请求体/聊天限流/安全头 | `test_security_headers_are_added`、`test_body_limit_returns_413`、`test_chat_rate_limit_returns_429`、`test_concurrency_limit`、`test_per_minute_limit` |
 | 代理身份注入 | `test_signed_identity_and_spoof_stripping` |
@@ -269,7 +281,7 @@ MIGRATIONS: list[tuple[int, tuple[str, ...]]] = [
 
 ## 6. 提交前检查清单
 
-- [ ] `python -m unittest discover -s tests` 全绿（当前 103 个）
+- [ ] `python -m unittest discover -s tests` 全绿（当前 105 个）
 - [ ] `python -m compileall -q gateway tests examples run.py` 通过
 - [ ] 改了接口/事件/错误码 → 同步 `docs/api.md`
 - [ ] 改了行为或配置 → 同步 `README.md` 与 `.env.example`
