@@ -37,6 +37,7 @@ class RouteInventoryTests(unittest.TestCase):
             "/agents", "/agents/{agent_id}", "/runs/{run_id}",
             "/users", "/users/{user_id}", "/api-keys", "/api-keys/{key_id}",
             "/audit", "/proxy-status", "/proxy-ticket", "/metrics",
+            "/assets/{filename}",
         }
         self.assertTrue(expected <= paths, expected - paths)
 

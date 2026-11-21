@@ -362,8 +362,8 @@ ydd_python_gateway_origion/
 │   ├── config.py               # 配置加载和检查
 │   └── errors.py               # 共用错误类型
 ├── web/
-│   ├── chat.html               # 内置浏览器聊天页（无外部依赖）
-│   └── login.html              # 登录页（local 认证模式）
+│   ├── chat.html / chat.css / chat.js     # 内置聊天页（无外部依赖，严格 CSP）
+│   └── login.html / login.css / login.js  # 登录页（local 认证模式）
 ├── docs/                       # 技术文档：架构、接口、决策、开发
 ├── docs/proposals/             # 设计提案（健康检查、路由重构已实现）
 ├── examples/                   # HTTP、WebSocket 与管理接口示例
@@ -673,9 +673,12 @@ $key.key   # 明文只返回这一次，请立即保存
 
 ### 请求体与聊天限流
 
-- 内置接口的请求体默认上限 **1 MB**（`GATEWAY_MAX_BODY_BYTES`），超过返回 `413 body_too_large`；反向代理前缀豁免，由上游自行控制；
+- 内置接口的请求体默认上限 **1 MB**（`GATEWAY_MAX_BODY_BYTES`），超过返回 `413 body_too_large`；
+  **带 Content-Length 和 chunked 请求都限制**（chunked 边读边计数），反向代理前缀豁免；
 - 每个用户同时最多 **3 轮**聊天、每分钟最多 **60 次**（`GATEWAY_CHAT_CONCURRENCY` / `GATEWAY_CHAT_PER_MINUTE`）；超限返回 `429 too_many_concurrent` / `429 rate_limited`；WS 的每一轮同样计数；
-- 所有响应带 `X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: same-origin`。
+- 所有响应带 `X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: same-origin`；
+- **HTML 页面带严格 CSP**：`script-src 'self'; style-src 'self'; frame-ancestors 'none'` 等，
+  脚本/样式已外置到 `/assets/`（白名单只暴露 4 个文件），页面里不再有内联 `<script>` / `<style>`。
 
 ### 认证相关接口
 

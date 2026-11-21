@@ -33,6 +33,14 @@ from .tickets import TicketStore
 
 logger = logging.getLogger(__name__)
 
+WEB_DIR = CHAT_PAGE.parent
+ASSETS = {
+    "chat.css": "text/css; charset=utf-8",
+    "chat.js": "text/javascript; charset=utf-8",
+    "login.css": "text/css; charset=utf-8",
+    "login.js": "text/javascript; charset=utf-8",
+}
+
 
 def create_app(settings: Settings | None = None,
                log_settings: LogSettings | None = None) -> FastAPI:
@@ -129,6 +137,15 @@ def create_app(settings: Settings | None = None,
         # 页面本身不含任何密钥，只是让浏览器能打开聊天界面；数据仍需登录/凭证。
         return FileResponse(CHAT_PAGE, media_type="text/html",
                             headers={"Cache-Control": "no-store"})
+
+    @app.get("/assets/{filename}")
+    async def asset(filename: str):
+        # 只暴露白名单里的静态文件，不做任意路径读取。
+        media_type = ASSETS.get(filename)
+        if media_type is None:
+            raise GatewayError(404, "not_found", "资源不存在。")
+        return FileResponse(WEB_DIR / filename, media_type=media_type,
+                            headers={"Cache-Control": "public, max-age=3600"})
 
     @app.get("/health")
     async def health():

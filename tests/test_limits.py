@@ -32,6 +32,38 @@ class LimitTests(unittest.TestCase):
         self.assertEqual(response.headers["x-frame-options"], "DENY")
         self.assertEqual(response.headers["referrer-policy"], "same-origin")
 
+    def test_html_pages_get_strict_csp(self):
+        with TestClient(create_app(self.settings())) as client:
+            page = client.get("/")
+            health = client.get("/health")
+        csp = page.headers["content-security-policy"]
+        self.assertIn("script-src 'self'", csp)
+        self.assertIn("style-src 'self'", csp)
+        self.assertIn("frame-ancestors 'none'", csp)
+        self.assertNotIn("unsafe-inline", csp)
+        self.assertNotIn("content-security-policy", health.headers)
+
+    def test_static_assets_are_served_from_whitelist(self):
+        with TestClient(create_app(self.settings())) as client:
+            script = client.get("/assets/chat.js")
+            style = client.get("/assets/login.css")
+            missing = client.get("/assets/nope.js")
+        self.assertEqual(script.status_code, 200)
+        self.assertIn("javascript", script.headers["content-type"])
+        self.assertIn("use strict", script.text)
+        self.assertIn("text/css", style.headers["content-type"])
+        self.assertEqual(missing.status_code, 404)
+
+    def test_chunked_body_over_limit_returns_413(self):
+        def chunks():
+            yield b'{"title":"' + b"x" * 300 + b'"}'
+
+        with TestClient(create_app(self.settings(max_body_bytes=200))) as client:
+            response = client.post("/sessions", content=chunks(),
+                                   headers={"Content-Type": "application/json"})
+        self.assertEqual(response.status_code, 413)
+        self.assertEqual(response.json()["error"]["code"], "body_too_large")
+
     def test_body_limit_returns_413(self):
         with TestClient(create_app(self.settings(max_body_bytes=200))) as client:
             response = client.post("/sessions", json={"title": "x" * 400})

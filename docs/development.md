@@ -42,7 +42,7 @@ Copy-Item .env.example .env
 | 顺序 | 文件 | 行数 | 读它是为了知道 |
 | --- | --- | --- | --- |
 | 1 | `run.py` | 41 | 入口、监听地址、日志初始化、对外监听保护 |
-| 2 | `gateway/app.py` | 144 | 装配：AppContext、lifespan、中间件、异常处理、注册路由、审计巡检任务 |
+| 2 | `gateway/app.py` | 161 | 装配：AppContext、lifespan、中间件、异常处理、路由、静态资源白名单 |
 | 3 | `gateway/container.py` | 26 | `AppContext` 里有哪些依赖 |
 | 4 | `gateway/api/deps.py` | 255 | 鉴权、CSRF、viewer 只读、API Key scope、归属检查、审计包装 |
 | 5 | `gateway/api/models.py` | 78 | 请求/响应模型与页面路径 |
@@ -71,9 +71,10 @@ Copy-Item .env.example .env
 | 28 | `gateway/proxy.py` | 534 | 反向代理：路由表校验、加权轮询与冷却、HTTP 流式转发、WS 桥接、身份注入 |
 | 29 | `gateway/proxy_health.py` | 178 | 主动探活：周期探测、健康状态机、状态快照 |
 | 30 | `gateway/config.py` | 165 | 配置项与启动校验 |
-| 31 | `web/chat.html` / `web/login.html` | 330 / 约 100 | 聊天页与登录页（均无外部依赖） |
+| 31 | `web/chat.html` + `chat.css`/`chat.js` | 42 + 57/230 | 聊天页（外部 CSS/JS，严格 CSP） |
+| 32 | `web/login.html` + `login.css`/`login.js` | 24 + 33/18 | 登录页（外部 CSS/JS，严格 CSP） |
 
-合计约 4,500 行 Python（含注释与文档字符串）+ 约 430 行页面，不含测试。
+合计约 4,550 行 Python（含注释与文档字符串）+ 约 400 行页面，不含测试。
 行数会漂移，用它判断"该先读哪个"，不要当作精确指标。
 
 不熟悉的状态机、错误分层、并发模型，先看 [architecture.md](architecture.md)。
@@ -84,7 +85,7 @@ Copy-Item .env.example .env
 
 `tests/test_gateway.py`（约 1,080 行，55 个用例）覆盖业务链路，`tests/test_logging.py`（约 170 行，8 个用例）覆盖日志，
 `tests/test_audit.py`（约 100 行，5 个用例）覆盖审计，`tests/test_auth.py`（约 180 行，10 个用例）覆盖本地认证，
-`tests/test_api_keys.py`（约 140 行，5 个用例）覆盖 API Key，`tests/test_ownership.py`（约 130 行，5 个用例）覆盖归属与角色，`tests/test_users.py`（约 140 行，7 个用例）覆盖用户管理、密码策略与登录限速，`tests/test_limits.py`（约 80 行，5 个用例）覆盖限流与安全头，`tests/test_proxy_identity.py`（约 70 行，1 个用例）覆盖代理身份签名，`tests/test_routes.py`（约 45 行，1 个用例）检查路由清单与重复注册，`tests/test_maintenance.py`（约 70 行，3 个用例）覆盖审计清理，`tests/test_backup.py`（约 70 行，3 个用例）覆盖备份与快照保留，`tests/test_metrics.py`（约 80 行，3 个用例）覆盖指标与鉴权，`tests/test_storage_pool.py`（约 60 行，3 个用例）覆盖连接复用。原则是**从真实入口验证**：
+`tests/test_api_keys.py`（约 140 行，5 个用例）覆盖 API Key，`tests/test_ownership.py`（约 130 行，5 个用例）覆盖归属与角色，`tests/test_users.py`（约 140 行，7 个用例）覆盖用户管理、密码策略与登录限速，`tests/test_limits.py`（约 110 行，8 个用例）覆盖限流、安全头、CSP、静态资源与 chunked 限制，`tests/test_proxy_identity.py`（约 70 行，1 个用例）覆盖代理身份签名，`tests/test_routes.py`（约 45 行，1 个用例）检查路由清单与重复注册，`tests/test_maintenance.py`（约 70 行，3 个用例）覆盖审计清理，`tests/test_backup.py`（约 70 行，3 个用例）覆盖备份与快照保留，`tests/test_metrics.py`（约 80 行，3 个用例）覆盖指标与鉴权，`tests/test_storage_pool.py`（约 60 行，3 个用例）覆盖连接复用。原则是**从真实入口验证**：
 
 - 用 `fastapi.testclient.TestClient` 走真实的 HTTP 与 WebSocket 路径，不直接调用 `ChatService`；
 - 模型服务用本地 `ThreadingHTTPServer` 替身（`ModelStub`），反向代理则用 `EchoStub`（HTTP）与
@@ -141,7 +142,7 @@ Copy-Item .env.example .env
 | 连接复用 | `test_reuses_the_same_connection`、`test_connect_after_close_creates_new_connection`、`test_concurrent_reads_are_safe` |
 | 指标 | `test_http_counters_and_auth`、`test_metrics_requires_admin_or_metrics_scope`、`test_ws_gauge` |
 | 用户管理与密码/限速 | `test_create_update_and_reset_password`、`test_last_admin_cannot_be_disabled`、`test_disabled_user_cannot_login_and_sessions_are_revoked`、`test_member_cannot_manage_users`、`test_self_password_change_revokes_other_sessions`、`test_password_policy_is_shared`、`test_ip_level_limiter_stops_username_spraying` |
-| 请求体/聊天限流/安全头 | `test_security_headers_are_added`、`test_body_limit_returns_413`、`test_chat_rate_limit_returns_429`、`test_concurrency_limit`、`test_per_minute_limit` |
+| 请求体/聊天限流/安全头 | `test_security_headers_are_added`、`test_html_pages_get_strict_csp`、`test_static_assets_are_served_from_whitelist`、`test_chunked_body_over_limit_returns_413`、`test_body_limit_returns_413`、`test_chat_rate_limit_returns_429`、`test_concurrency_limit`、`test_per_minute_limit` |
 | 代理身份注入 | `test_signed_identity_and_spoof_stripping` |
 | demo 模式零依赖 | `test_default_demo_requires_no_model_service` |
 
@@ -288,7 +289,7 @@ MIGRATIONS: list[tuple[int, tuple[str, ...]]] = [
 
 ## 6. 提交前检查清单
 
-- [ ] `python -m unittest discover -s tests` 全绿（当前 117 个）
+- [ ] `python -m unittest discover -s tests` 全绿（当前 120 个）
 - [ ] `python -m compileall -q gateway tests examples run.py` 通过
 - [ ] 改了接口/事件/错误码 → 同步 `docs/api.md`
 - [ ] 改了行为或配置 → 同步 `README.md` 与 `.env.example`

@@ -56,7 +56,14 @@ class UserLimiter:
 
 
 class BodyLimitMiddleware:
-    """对内置接口限制请求体；代理前缀豁免（文件上传由代理自行控制）。"""
+    """对内置接口限制请求体；代理前缀豁免（文件上传由代理自行控制）。
+
+    先按 Content-Length 快速拒绝；没有长度（chunked）时边读边计数，
+    超过上限立即返回 413，不再把请求交给业务。
+    """
+
+    BODY_TOO_LARGE = ('{"error":{"code":"body_too_large","message":"请求体超过限制。"}}'
+                      ).encode("utf-8")
 
     def __init__(self, app, max_bytes: int, exempt_prefixes: tuple[str, ...] = ()) -> None:
         self.app = app
@@ -66,28 +73,61 @@ class BodyLimitMiddleware:
     def _exempt(self, path: str) -> bool:
         return any(path.startswith(prefix) for prefix in self.exempt_prefixes)
 
+    async def _reject(self, send) -> None:
+        await send({"type": "http.response.start", "status": 413,
+                    "headers": [(b"content-type", b"application/json; charset=utf-8"),
+                                (b"content-length",
+                                 str(len(self.BODY_TOO_LARGE)).encode())]})
+        await send({"type": "http.response.body", "body": self.BODY_TOO_LARGE})
+
     async def __call__(self, scope, receive, send) -> None:
         if scope["type"] != "http" or scope.get("method") not in BODY_METHODS \
                 or self._exempt(scope.get("path", "")):
             await self.app(scope, receive, send)
             return
         try:
-            length = int(Headers(scope=scope).get("content-length", "0"))
+            declared = int(Headers(scope=scope).get("content-length", "0"))
         except ValueError:
-            length = 0
-        if length <= self.max_bytes:
-            await self.app(scope, receive, send)
+            declared = 0
+        if declared > self.max_bytes:
+            await self._reject(send)
             return
-        body = ('{"error":{"code":"body_too_large","message":"请求体超过限制。"}}'
-                ).encode("utf-8")
-        await send({"type": "http.response.start", "status": 413,
-                    "headers": [(b"content-type", b"application/json; charset=utf-8"),
-                                (b"content-length", str(len(body)).encode())]})
-        await send({"type": "http.response.body", "body": body})
+
+        messages = []
+        received = 0
+        while True:
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                messages.append(message)
+                break
+            chunk = message.get("body") or b""
+            received += len(chunk)
+            if received > self.max_bytes:
+                await self._reject(send)
+                return
+            messages.append(message)
+            if not message.get("more_body", False):
+                break
+
+        replay = list(messages)
+
+        async def receive_replay():
+            if replay:
+                return replay.pop(0)
+            return {"type": "http.disconnect"}
+
+        await self.app(scope, receive_replay, send)
+
+
+CONTENT_SECURITY_POLICY = (
+    "default-src 'self'; script-src 'self'; style-src 'self'; "
+    "img-src 'self' data:; connect-src 'self' ws: wss:; font-src 'self'; "
+    "object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+)
 
 
 class SecurityHeadersMiddleware:
-    """统一加低风险安全头；页面仍保持可用（暂不加 CSP，避免内联脚本失效）。"""
+    """统一加低风险安全头；HTML 页面额外加严格 CSP（脚本/样式都已外置）。"""
 
     HEADERS = (
         (b"x-content-type-options", b"nosniff"),
@@ -109,6 +149,10 @@ class SecurityHeadersMiddleware:
                 headers = Headers(scope=message)
                 extra = [(name, value) for name, value in self.HEADERS
                          if name.decode() not in headers]
+                if "text/html" in headers.get("content-type", "") \
+                        and "content-security-policy" not in headers:
+                    extra.append((b"content-security-policy",
+                                  CONTENT_SECURITY_POLICY.encode("utf-8")))
                 if extra:
                     message["headers"] = [*message["headers"], *extra]
             await send(message)

@@ -492,6 +492,30 @@ Key 不能管理 Key；管理员可撤销；`last_used_at` 最多每分钟更新
 
 ---
 
+## ADR-022 页面严格 CSP（外置静态资源）+ chunked 请求体限制
+
+**背景**：安全头里一直没有 CSP（内联脚本无法严格限制）；请求体上限只看 `Content-Length`，
+chunked 请求可以绕过。
+
+**决定**
+
+- 把 `chat.html` / `login.html` 的 `<style>`、`<script>` 拆到 `web/*.css` / `web/*.js`，
+  由 `/assets/{filename}` 白名单提供（只允许 4 个文件，不做任意路径读取）；
+- HTML 响应加严格 CSP：`script-src 'self'; style-src 'self'; img-src 'self' data:;
+  connect-src 'self' ws: wss:; frame-ancestors 'none'` 等；
+- `BodyLimitMiddleware` 先看 `Content-Length`，没有长度时边读边计数；超限立即返回 413，
+  不再把请求交给业务；读到的消息按原顺序回放给下游，请求体解析不受影响；
+- 代理前缀仍然豁免（上游自己控制大文件上传）。
+
+**后果**
+
+- 页面里不再有内联脚本/样式，CSP 不需要 `'unsafe-inline'`；新增页面资源必须登记到白名单。
+- 请求体在进入业务前会被缓冲（最多 1 MB），这是为了能准确返回 413；代理路径不缓冲。
+- CSP 依赖页面不再使用内联事件处理器；后续改页面时要遵守这条约定。
+- 已用真实浏览器验证：CSS/脚本加载、`/health` 请求、创建会话、WebSocket 聊天都正常。
+
+---
+
 ## 待定决策（已知但尚未做）
 
 | 主题 | 现状 | 若要做，建议 |

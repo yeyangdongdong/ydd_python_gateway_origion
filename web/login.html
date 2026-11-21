@@ -5,28 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>登录 · Agent Gateway</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232563eb'/%3E%3Ctext x='16' y='22' font-size='16' font-family='sans-serif' text-anchor='middle' fill='white'%3EG%3C/text%3E%3C/svg%3E">
-<style>
-  :root { color-scheme: light dark; --bg:#f5f6f8; --panel:#fff; --line:#dde2e8;
-          --text:#1f2328; --muted:#6b7280; --brand:#2563eb; --bad:#b42318; }
-  @media (prefers-color-scheme: dark) {
-    :root { --bg:#14171c; --panel:#1b1f26; --line:#2c3239; --text:#e6e8eb;
-            --muted:#9aa4b2; --brand:#4f8cff; --bad:#ff8a80; }
-  }
-  * { box-sizing: border-box; }
-  body { margin:0; min-height:100dvh; display:grid; place-items:center;
-         background:var(--bg); color:var(--text);
-         font:15px/1.6 "Segoe UI", system-ui, -apple-system, "Microsoft YaHei", sans-serif; }
-  form { width:min(360px, 92vw); background:var(--panel); border:1px solid var(--line);
-         border-radius:14px; padding:24px; display:flex; flex-direction:column; gap:12px; }
-  h1 { font-size:18px; margin:0 0 4px; }
-  label { font-size:13px; color:var(--muted); }
-  input { font:inherit; padding:9px 12px; border-radius:8px; border:1px solid var(--line);
-          background:var(--bg); color:var(--text); }
-  button { font:inherit; padding:9px 12px; border-radius:8px; border:0;
-           background:var(--brand); color:#fff; cursor:pointer; }
-  .error { display:none; color:var(--bad); font-size:13px; margin:0; }
-  .error.show { display:block; }
-</style>
+<!-- 样式与脚本外置，配合严格 CSP（script-src 'self'; style-src 'self'）。 -->
+<link rel="stylesheet" href="/assets/login.css">
 </head>
 <body>
 <form method="post" action="/login">
@@ -39,16 +19,6 @@
   <input type="hidden" name="next" id="next" value="/">
   <button type="submit">登录</button>
 </form>
-<script>
-  // 登录失败时后端会 303 回 /login?error=invalid|locked，这里只做提示。
-  const error = new URLSearchParams(location.search).get("error");
-  const note = document.getElementById("error");
-  if (error === "invalid") { note.textContent = "用户名或密码不正确。"; note.classList.add("show"); }
-  if (error === "locked") { note.textContent = "失败次数过多，请稍后再试。"; note.classList.add("show"); }
-  const next = new URLSearchParams(location.search).get("next");
-  if (next && next.startsWith("/") && !next.startsWith("//")) {
-    document.getElementById("next").value = next;
-  }
-</script>
+<script src="/assets/login.js"></script>
 </body>
 </html>
