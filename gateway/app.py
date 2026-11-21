@@ -3,8 +3,9 @@
 业务路由在 `gateway/api/` 下按资源拆分；这里只负责把它们和进程级资源接起来。
 """
 
+import asyncio
 import logging
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -21,6 +22,7 @@ from .container import AppContext
 from .errors import GatewayError
 from .limits import BodyLimitMiddleware, SecurityHeadersMiddleware, UserLimiter
 from .logging_setup import LogSettings
+from .maintenance import audit_janitor, prune_audit
 from .provider import ModelProvider
 from .proxy import Proxy, load_routes
 from .proxy_routes import build_proxy_router, register_forwarders
@@ -52,6 +54,17 @@ def create_app(settings: Settings | None = None,
     async def lifespan(app: FastAPI):
         await run_in_threadpool(ctx.store.initialize, settings.model)
         try:
+            removed = await run_in_threadpool(prune_audit, ctx.store,
+                                              settings.audit_retention_days)
+            if removed:
+                await run_in_threadpool(
+                    ctx.audit.append, action="audit.prune", actor_type="system",
+                    actor_name="startup",
+                    details={"deleted": removed,
+                             "retention_days": settings.audit_retention_days})
+        except Exception:      # 清理失败不应阻止服务启动
+            logger.exception("Startup audit prune failed")
+        try:
             await run_in_threadpool(ctx.audit.append, action="gateway.start",
                                     actor_type="system", actor_name="gateway",
                                     details={"version": "0.1.0",
@@ -71,9 +84,14 @@ def create_app(settings: Settings | None = None,
         app.state.chat, app.state.proxy = ctx.chat, ctx.proxy
         if ctx.proxy is not None:
             ctx.proxy.start()
+        janitor = asyncio.create_task(audit_janitor(
+            ctx.store, ctx.audit, settings.audit_retention_days))
         try:
             yield
         finally:
+            janitor.cancel()
+            with suppress(asyncio.CancelledError):
+                await janitor
             await provider.close()
             if ctx.proxy is not None:
                 await ctx.proxy.close()

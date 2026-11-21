@@ -327,6 +327,9 @@ Agent、会话、消息和运行记录均保存在 SQLite。成功后，助手�
 | `GATEWAY_MAX_BODY_BYTES` | `1048576` | 内置接口请求体上限（代理前缀豁免） |
 | `GATEWAY_CHAT_CONCURRENCY` | `3` | 每个用户同时进行的聊天轮数上限 |
 | `GATEWAY_CHAT_PER_MINUTE` | `60` | 每个用户每分钟聊天请求上限 |
+| `GATEWAY_AUDIT_RETENTION_DAYS` | `180` | 审计表保留天数（启动时 + 每日清理） |
+| `GATEWAY_BACKUP_DIR` | `D:\Document\backup\logs` | 备份根目录 |
+| `GATEWAY_BACKUP_KEEP` | `14` | 保留最近多少个备份快照；`0` 表示不清理 |
 
 `run.py` 默认只监听 `127.0.0.1:8000`。局域网访问请按「13. 部署：Caddy 前置 HTTPS」用 Caddy 终结 HTTPS；直接监听 `0.0.0.0` 且未启用 HTTPS 会被启动护栏拒绝。不要把 `.env` 或数据库提交到代码仓库。
 
@@ -348,6 +351,8 @@ ydd_python_gateway_origion/
 │   ├── access_log.py           # 访问日志中间件与参数脱敏
 │   ├── logging_setup.py        # JSON 格式化、按类别/服务分文件、异步写盘
 │   ├── audit.py                # 审计双写（数据库 + 文件）
+│   ├── maintenance.py          # 审计保留期清理与每日巡检
+│   ├── backup.py               # 备份命令（日志按服务 + 数据库快照）
 │   ├── auth.py                 # 密码哈希、会话 token、登录限速
 │   ├── admin.py                # 命令行管理用户（python -m gateway.admin）
 │   ├── storage.py              # SQLite 表、迁移和读写操作
@@ -524,7 +529,41 @@ GET /audit?limit=100&offset=0&action=agent.delete&result=ok
   "target":{"type":"agent","id":"2b1c..."},"details":{}}]
 ```
 
-审计写入是**旁路**：写库失败只记 ERROR，不会让业务请求失败；需要强合规时把 `audit` 日志采集到外部 WORM / SIEM，网关自身无法提供防篡改。审计文件保留期由 `GATEWAY_AUDIT_BACKUP_DAYS` 控制（默认 180 天）。
+审计写入是**旁路**：写库失败只记 ERROR，不会让业务请求失败；需要强合规时把 `audit` 日志采集到外部 WORM / SIEM，网关自身无法提供防篡改。
+
+### 审计清理与备份
+
+- **审计表**默认保留 180 天（`GATEWAY_AUDIT_RETENTION_DAYS`）：启动时清理一次，之后每天巡检一次；
+  审计**文件**的保留期由 `GATEWAY_AUDIT_BACKUP_DAYS` 单独控制，两者互不影响；
+- **备份命令**默认写到 `D:\Document\backup\logs`：
+
+```powershell
+# 备份日志 + 数据库（默认保留最近 14 个快照）
+python -m gateway.backup
+
+# 只备份日志 / 只保留 7 个快照 / 只看计划
+python -m gateway.backup --no-db --keep 7
+python -m gateway.backup --dry-run
+
+# 手动清理审计表（默认按配置的保留天数）
+python -m gateway.backup prune-audit --days 180 --dry-run
+```
+
+每个快照一个目录，**日志按原类别与服务保留**：
+
+```text
+D:\Document\backup\logs\2026-11-21_120000\
+├── manifest.json                 # 按服务汇总的文件数/字节数
+├── database\gateway.sqlite3      # SQLite backup API，WAL 下也一致
+└── logs\
+    ├── access\2026-11-21.log
+    ├── audit\2026-11-21.log
+    └── services\finance\2026-11-21.log
+```
+
+- 数据库用 `sqlite3.Connection.backup` 复制，运行中也能得到一致快照；
+- 备份与清理都会写审计（`backup.create` / `audit.prune`）；
+- `GATEWAY_BACKUP_DIR` 可改备份根目录，`GATEWAY_BACKUP_KEEP` 控制保留快照数（`0` 表示不清理）。
 
 ## 12. 用户与认证（局域网多人）
 

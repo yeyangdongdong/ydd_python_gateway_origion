@@ -92,6 +92,8 @@
 | `gateway/access_log.py` | 访问日志中间件：路径、参数摘要、脱敏、trace_id | `AccessLogMiddleware`、`redact` | 不改请求/响应内容 |
 | `gateway/logging_setup.py` | JSON 格式化、按类别/服务分文件、队列写盘、保留策略 | `LogSettings`、`setup_logging`、`DailyFileHandler` | 不决定"记什么"，只负责怎么记 |
 | `gateway/audit.py` | 审计双写：`audit_log` 表 + `audit/` 文件；查询投影 | `AuditTrail` | 不改业务结果（写失败只记 ERROR） |
+| `gateway/maintenance.py` | 审计保留期清理；启动一次 + 每日后台巡检 | `prune_audit`、`audit_janitor` | 不删审计文件（文件由日志轮转负责） |
+| `gateway/backup.py` | 备份日志（按类别/服务）与数据库快照、清理旧快照 | `backup`、`main` | 不改源数据 |
 | `gateway/storage.py` | SQLite 表、迁移、索引、事务、查询 | `Store`、`MIGRATIONS` | 不 import `service`，不知道 HTTP |
 | `gateway/tickets.py` | 一次性票据的签发与核销 | `TicketStore`、`TICKET_SECONDS` | 不持久化、不加锁（单事件循环） |
 | `gateway/config.py` | 读环境变量 / `.env`，启动时校验 | `Settings`、`read_flag` | 不做运行时热更新 |

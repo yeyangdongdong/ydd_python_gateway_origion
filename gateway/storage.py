@@ -550,6 +550,29 @@ class Store:
         with self.connect() as db:
             db.execute("UPDATE api_keys SET last_used_at = ? WHERE id = ?", (timestamp, key_id))
 
+    def count_audit_before(self, before: str) -> int:
+        with self.connect() as db:
+            row = db.execute("SELECT COUNT(*) FROM audit_log WHERE ts < ?",
+                             (before,)).fetchone()
+        return int(row[0])
+
+    def prune_audit(self, before: str, batch: int = 1000) -> int:
+        """删除 ts 早于 before 的审计行；分批提交，避免长时间持有写锁。"""
+        deleted = 0
+        while True:
+            with self.connect() as db:
+                rows = db.execute(
+                    "SELECT id FROM audit_log WHERE ts < ? LIMIT ?", (before, batch)
+                ).fetchall()
+                if not rows:
+                    break
+                db.executemany("DELETE FROM audit_log WHERE id = ?",
+                               [(row["id"],) for row in rows])
+                deleted += len(rows)
+            if len(rows) < batch:
+                break
+        return deleted
+
     @staticmethod
     def _row(db: sqlite3.Connection, query: str, *parameters: object) -> sqlite3.Row | None:
         """查询单行；调用方只关心“有 / 没有”时比 fetchone() 更好读。"""

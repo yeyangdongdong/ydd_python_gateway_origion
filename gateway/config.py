@@ -62,6 +62,11 @@ class Settings:
     # 每个用户的聊天并发与每分钟请求数。
     chat_concurrency: int = 3
     chat_per_minute: int = 60
+    # 审计表保留天数；文件保留由 GATEWAY_AUDIT_BACKUP_DAYS 控制，两者独立。
+    audit_retention_days: int = 180
+    # 备份目录与保留快照数。
+    backup_dir: Path = Path(r"D:\Document\backup\logs")
+    backup_keep: int = 14
 
     def __post_init__(self) -> None:
         if self.provider not in {"demo", "openai"}:
@@ -96,9 +101,12 @@ class Settings:
                 raise ValueError(f"{name} 必须是正整数。")
         for name, value in (("GATEWAY_MAX_BODY_BYTES", self.max_body_bytes),
                             ("GATEWAY_CHAT_CONCURRENCY", self.chat_concurrency),
-                            ("GATEWAY_CHAT_PER_MINUTE", self.chat_per_minute)):
+                            ("GATEWAY_CHAT_PER_MINUTE", self.chat_per_minute),
+                            ("GATEWAY_AUDIT_RETENTION_DAYS", self.audit_retention_days)):
             if value <= 0:
                 raise ValueError(f"{name} 必须是正整数。")
+        if self.backup_keep < 0:
+            raise ValueError("GATEWAY_BACKUP_KEEP 不能为负数。")
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -123,6 +131,8 @@ class Settings:
             max_body = int(os.getenv("GATEWAY_MAX_BODY_BYTES", str(1024 * 1024)))
             chat_concurrency = int(os.getenv("GATEWAY_CHAT_CONCURRENCY", "3"))
             chat_per_minute = int(os.getenv("GATEWAY_CHAT_PER_MINUTE", "60"))
+            audit_retention = int(os.getenv("GATEWAY_AUDIT_RETENTION_DAYS", "180"))
+            backup_keep = int(os.getenv("GATEWAY_BACKUP_KEEP", "14"))
         except ValueError as exc:
             raise ValueError("模型与登录相关的数值配置必须为整数/数字。") from exc
         return cls(
@@ -149,4 +159,7 @@ class Settings:
             max_body_bytes=max_body,
             chat_concurrency=chat_concurrency,
             chat_per_minute=chat_per_minute,
+            audit_retention_days=audit_retention,
+            backup_dir=Path(os.getenv("GATEWAY_BACKUP_DIR", r"D:\Document\backup\logs")),
+            backup_keep=backup_keep,
         )
