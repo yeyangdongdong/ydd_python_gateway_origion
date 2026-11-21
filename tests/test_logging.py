@@ -197,6 +197,22 @@ class ServiceLogTests(unittest.TestCase):
             self.assertIn("upstream", entry)
 
 
+class FormatterRedactionTests(unittest.TestCase):
+    def test_message_query_secrets_are_redacted(self):
+        message = ('WebSocket /sessions/x/stream?ticket=secret-ticket'
+                   '&token=secret-token&api_key=secret-key&page=1')
+        record = logging.LogRecord("uvicorn.error", logging.INFO, __file__, 1,
+                                   message, None, None)
+        payload = json.loads(JsonFormatter().format(record))
+        rendered = payload["message"]
+        for secret in ("secret-ticket", "secret-token", "secret-key"):
+            self.assertNotIn(secret, rendered)
+        self.assertIn("ticket=***", rendered)
+        self.assertIn("token=***", rendered)
+        self.assertIn("api_key=***", rendered)
+        self.assertIn("page=1", rendered)
+
+
 class DailyHandlerTests(unittest.TestCase):
     def test_size_rotation_and_retention_cleanup(self):
         with tempfile.TemporaryDirectory() as tmp:

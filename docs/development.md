@@ -83,7 +83,7 @@ Copy-Item .env.example .env
 
 ### 3.1 结构
 
-`tests/test_gateway.py`（约 1,080 行，55 个用例）覆盖业务链路，`tests/test_logging.py`（约 170 行，8 个用例）覆盖日志，
+`tests/test_gateway.py`（约 1,080 行，55 个用例）覆盖业务链路，`tests/test_logging.py`（约 190 行，10 个用例）覆盖日志，
 `tests/test_audit.py`（约 100 行，5 个用例）覆盖审计，`tests/test_auth.py`（约 180 行，10 个用例）覆盖本地认证，
 `tests/test_api_keys.py`（约 140 行，5 个用例）覆盖 API Key，`tests/test_ownership.py`（约 130 行，5 个用例）覆盖归属与角色，`tests/test_users.py`（约 140 行，7 个用例）覆盖用户管理、密码策略与登录限速，`tests/test_limits.py`（约 110 行，8 个用例）覆盖限流、安全头、CSP、静态资源与 chunked 限制，`tests/test_proxy_identity.py`（约 70 行，1 个用例）覆盖代理身份签名，`tests/test_routes.py`（约 45 行，1 个用例）检查路由清单与重复注册，`tests/test_maintenance.py`（约 70 行，3 个用例）覆盖审计清理，`tests/test_backup.py`（约 70 行，3 个用例）覆盖备份与快照保留，`tests/test_metrics.py`（约 80 行，3 个用例）覆盖指标与鉴权，`tests/test_storage_pool.py`（约 60 行，3 个用例）覆盖连接复用，`tests/test_cors.py`（约 75 行，4 个用例）覆盖 CORS/CSRF，`tests/test_ws_ping.py`（约 30 行，3 个用例）覆盖 WS ping 配置。原则是**从真实入口验证**：
 
@@ -292,7 +292,7 @@ MIGRATIONS: list[tuple[int, tuple[str, ...]]] = [
 
 ## 6. 提交前检查清单
 
-- [ ] `python -m unittest discover -s tests` 全绿（当前 132 个）
+- [ ] `python -m unittest discover -s tests` 全绿（当前 134 个）
 - [ ] `python -m compileall -q gateway tests examples run.py` 通过
 - [ ] 改了接口/事件/错误码 → 同步 `docs/api.md`
 - [ ] 改了行为或配置 → 同步 `README.md` 与 `.env.example`

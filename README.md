@@ -484,7 +484,7 @@ D:\Document\logs\ydd-gateway\
 ├── access\2026-11-21.log      # 每个请求一行：路径、参数、状态、耗时、trace_id
 ├── app\2026-11-21.log         # 启动、迁移、未预期异常
 ├── proxy\2026-11-21.log       # 选路、冷却、探活
-├── auth\2026-11-21.log        # 登录与会话（阶段 3 起）
+├── auth\2026-11-21.log        # 登录与会话（local 模式）
 ├── audit\2026-11-21.log       # 审计留痕（与 audit 表双写）
 └── services\finance\2026-11-21.log   # 被代理服务各自的访问日志
 ```
@@ -520,9 +520,9 @@ D:\Document\logs\ydd-gateway\
 | `agent.create` / `agent.update` / `agent.delete` | Agent 管理 |
 | `session.update` / `session.delete` / `session.clear` | 会话改名、删除、清空历史 |
 | `gateway.start` | 服务启动（含版本与路由数量） |
-| `auth.*`（阶段 3） | 登录成功/失败、登出、API Key 变更 |
+| `auth.*`（local 模式） | 登录成功/失败、登出、API Key 变更 |
 
-查询（需鉴权；阶段 3 起限定管理员）：
+查询（仅管理员）：
 
 ```text
 GET /audit?limit=100&offset=0&action=agent.delete&result=ok
@@ -715,8 +715,9 @@ GATEWAY_CORS_ORIGINS=http://localhost:5173,https://tools.example.com
 | POST | `/login` | 表单登录，成功 303 并下发 Cookie |
 | POST | `/logout` | 吊销当前会话并清除 Cookie（需登录，带 CSRF 校验） |
 | GET | `/auth/status` | 当前认证模式与登录用户 |
-| GET | `/api-keys` | 列出 API Key（管理员） |
-| POST | `/api-keys` | 创建 API Key，返回一次性明文（管理员） |
+| GET | `/api-keys` | 列出 API Key（管理员；含 `days_left`、`allowed_cidrs`） |
+| POST | `/api-keys` | 创建（管理员）：默认 180 天过期，`expires_in_days=0` 永不过期；可带 `allowed_cidrs` |
+| PATCH | `/api-keys/{id}` | 改名字/IP 白名单（管理员；scopes 变更请重建） |
 | DELETE | `/api-keys/{id}` | 撤销 API Key（管理员） |
 | GET | `/users` | 列出用户（管理员） |
 | POST | `/users` | 创建用户：`username`、`password`、`role`（管理员） |
@@ -753,10 +754,11 @@ GATEWAY_CORS_ORIGINS=http://localhost:5173,https://tools.example.com
 
 说明：
 
-- 网关只信任**回环对端**的 `X-Forwarded-For` / `X-Real-IP`，因此日志和登录限速拿到的是真实客户端 IP；
+- 网关自行还原客户端 IP（`run.py` 已关闭 uvicorn 的 proxy headers）：只信任**回环对端**，
+  优先 `X-Real-IP`，`X-Forwarded-For` 取最右段（最后可信代理追加的地址）；
 - 如果 Caddy 不在本机，需自行扩展信任列表（当前实现刻意只信任回环，防止伪造头）；
 - 直接监听非回环地址且未开 `GATEWAY_COOKIE_SECURE` 时，`run.py` 会拒绝启动；临时调试可显式设置 `GATEWAY_ALLOW_INSECURE_LAN=true`；
-- 反向代理的 `X-Forwarded-For` 也会被转发给上游（逐跳头除外），上游可据此记录真实来源。
+- 反向代理会原样转发 `X-Forwarded-For`；上游不应无条件信任该头，除非链路中只有可信代理。
 
 ## 14. 基础版范围
 
@@ -764,6 +766,6 @@ GATEWAY_CORS_ORIGINS=http://localhost:5173,https://tools.example.com
 
 本版适合学习、个人应用和小规模集成。每个数据库只能由一个 Gateway 进程运行；不要开启多 worker，也不要让两个实例共用数据库。会话排队锁位于进程内。
 
-本版不包含模型工具执行、频道插件、定时任务、多用户权限隔离、后台运行恢复和流事件重放。数据库里的历史不会自动删除或压缩：每次请求只是按预算裁剪"发给模型的内容"，存储始终完整。列表支持 `limit`/`offset` 翻页，但没有筛选和搜索。SQLite 中的历史会一直保留，直到你删除会话、清空历史或自行维护数据库。
+本版不包含模型工具执行、频道插件、定时任务、多租户隔离、后台运行恢复和流事件重放。多用户/角色/资源归属已支持（见「12. 用户与认证」）。数据库里的历史不会自动删除或压缩：每次请求只是按预算裁剪"发给模型的内容"，存储始终完整。列表支持 `limit`/`offset` 翻页，但没有筛选和搜索。SQLite 中的历史会一直保留，直到你删除会话、清空历史或自行维护数据库。
 
 会话排队锁和 WebSocket 票据都存放在进程内存里，这也是一份数据库只能由一个进程服务的原因之一：开启多 worker 后，票据可能被发到没有对应票据的进程上，连接会随机失败。

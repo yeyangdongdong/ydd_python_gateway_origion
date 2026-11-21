@@ -21,7 +21,7 @@
 | --- | --- |
 | 模型工具调用 / 函数调用 | 会引入工具注册、执行沙箱、多轮工具循环，基础版只保留文本链路 |
 | 多进程 / 多 worker | 会话锁与票据在进程内存中，SQLite 也只适合单写者 |
-| 多用户 / 权限隔离 | 只有"一个共享 token"这一级鉴权 |
+| 多租户（按组织硬隔离） | 单部署内已支持账号/角色/资源归属（见 §8），但不按组织切分数据 |
 | 流事件重放 | WS 断开即丢弃该轮未完成内容；已完成的结果可通过 `request_id` 重放 |
 | 历史压缩摘要 | 见 [design-decisions.md](design-decisions.md) ADR-006，当前只做预算裁剪 |
 | OpenAI 入站兼容层 | 目前是自定义 API，不是 `/v1/chat/completions` 的替代品 |
@@ -478,7 +478,9 @@ remaining   = budget − fixed − notice
 ```
 
 - scope 按资源检查：`sessions`（会话/消息/聊天/WS）、`agents`、`audit`、`proxy`；
-- API Key 不能管理 API Key，也不能默认读审计；
+- 默认 **180 天过期**（`GATEWAY_API_KEY_DEFAULT_DAYS`），`expires_in_days=0` 表示永不过期；
+- 可配置 `allowed_cidrs` 来源白名单（空=不限制），不匹配按 401 拒绝并计入指标；
+- API Key 不能管理 API Key，也不能默认读审计；`PATCH` 只能改名字/白名单，scopes 变更需重建；
 - `last_used_at` 最多每 60 秒更新一次，避免每个请求一个写事务；
 - 管理员可随时撤销；数据库泄露不会直接得到可用的 Key（只有哈希）。
 
@@ -630,9 +632,8 @@ get_session → find_request → messages → start_run → complete_run/fail_ru
 | 限制 | 影响 | 触发条件 |
 | --- | --- | --- |
 | 单进程 | 不能水平扩展 | 任何多实例部署 |
-| 单 token | 无法区分用户 | 多人共用 |
-| 无 TLS | token 明文过网 | 跨不可信网络 |
-| 票据进 URL | 可能被日志留存 | 长期保存访问日志 |
+| 无 TLS | 需由 Caddy 等前置终结 HTTPS | 跨不可信网络 |
+| 票据进 URL | 一次性 30 秒；网关日志已对 `ticket=` 打码，但前置代理访问日志仍可能留存 |
 | 迁移只进不退 | 升级后没有回滚脚本 | 需要降级时得手工处理 |
 | 历史不压缩 | 早期对话只能被丢弃 | 超预算 |
 | 列表无缓存语义 | 无 ETag / 条件请求，每次全量返回 | 高频轮询列表 |

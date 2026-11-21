@@ -324,7 +324,7 @@ uvicorn 访问日志无法脱敏，会把 `?ticket=` 原样写进日志；排查
 - 请求体只旁路复制前 `PARAM_MAX_BYTES` 字节，且不重建 Request，所以不影响业务解析。
 - 正文默认只留 200 字预览（可配置为 0），在"可排查"与"不泄露对话"之间取平衡。
 - **trace_id 必须在产出线程抓取**：格式化在队列线程执行，contextvars 不会跟过去，因此用 `TraceIdFilter` 把它写进记录。
-- 队列意味着进程崩溃时可能丢最后几条日志；审计留痕需要额外的强保证（见阶段 2）。
+- 队列意味着进程崩溃时可能丢最后几条日志；审计留痕另有 DB 双写（见 ADR-015）。
 - 日志字段从此是事实上的对外契约，字段变更要同步 README 与 architecture。
 
 ---
@@ -346,7 +346,7 @@ uvicorn 访问日志无法脱敏，会把 `?ticket=` 原样写进日志；排查
 
 **后果**
 
-- `GET /audit` 支持按 `action/result` 过滤与分页；阶段 3 会限定为管理员。
+- `GET /audit` 支持按 `action/result` 过滤与分页；已限定为管理员（见 `docs/api.md`）。
 - **fail-open 是刻意的**：内部工具里"审计库暂时不可用就拒绝所有写操作"代价过高；代价是极短窗口内的事件可能只有文件、没有库记录。
 - 没有防篡改保证：需要合规时把 `audit` 日志采集到外部 WORM/SIEM，网关不承诺自己也做不到的事。
 - 审计只记变更与认证事件，不记对话正文（与日志的脱敏原则一致）。
@@ -538,6 +538,32 @@ chunked 请求可以绕过。
 - 白名单会让配置错误直接表现为 401；排障时先看 `gateway_api_key_ip_rejections_total` 和 WARN 日志。
 - CORS 与 CSRF 共用同一份白名单，配置一处生效两处；不要把不可信站点加进去。
 - 心跳参数为 0 时关闭协议层检测，文档已标注风险。
+
+---
+
+## ADR-024 日志消息级脱敏；客户端 IP 由网关自己还原
+
+**背景**：审计发现两处与文档承诺不一致：
+
+1. uvicorn 的 WebSocket 握手日志走 `uvicorn.error`，会把 `?ticket=...` 原文写进 `app/` 日志；
+2. `forwarded_ip` 取 XFF 最左段，且 uvicorn 默认的 proxy headers 会先改写 `scope["client"]`，
+   导致 `X-Real-IP` 实际不生效、文档与行为不一致。
+
+**决定**
+
+- 在 `JsonFormatter` 里对 `message`（以及异常栈）统一打码 `ticket=/token=/api_key=/key=`；
+  这样无论日志来自网关还是 uvicorn，都不会落明文票据；
+- `run.py` 关闭 uvicorn 的 `proxy_headers`，由 `gateway/net.py` 统一还原：
+  只信任回环对端，优先 `X-Real-IP`，`X-Forwarded-For` 取最右段并校验为合法 IP；
+- Caddy 仍只部署在本机回环；若前置代理不在本机，需要扩展 `TRUSTED_PROXIES`。
+
+**后果**
+
+- 票据仍出现在 URL 里（一次性 30 秒），但网关日志不再留存；前置代理自己的访问日志仍需单独脱敏；
+- 关闭 uvicorn proxy headers 后，`scope["scheme"]` 在 Caddy 后仍是 `http`；
+  当前代码不依赖它生成绝对 URL（Cookie 的 `Secure` 由配置控制），因此无行为影响；
+- IP 白名单、登录限速、审计日志使用同一套还原逻辑，行为一致；
+- 代价是失去 uvicorn 对 `X-Forwarded-Proto` 的处理；将来若需要按 https 生成绝对链接，要自己读该头。
 
 ---
 

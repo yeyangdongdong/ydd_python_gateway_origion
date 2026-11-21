@@ -6,11 +6,20 @@ from gateway.net import forwarded_ip, ip_allowed
 
 
 class ForwardedIpTests(unittest.TestCase):
-    def test_trusts_forwarded_for_only_from_loopback(self):
-        self.assertEqual(forwarded_ip("127.0.0.1", "192.168.1.20, 127.0.0.1"), "192.168.1.20")
-        self.assertEqual(forwarded_ip("::1", None, "192.168.1.21"), "192.168.1.21")
-        self.assertEqual(forwarded_ip("192.168.1.50", "10.0.0.1"), "192.168.1.50")
+    def test_trusts_forwarded_headers_only_from_loopback(self):
+        # 伪造在最左段，真实客户端在最后一段（可信代理追加）。
+        self.assertEqual(forwarded_ip("127.0.0.1", "1.2.3.4, 192.168.1.20"),
+                         "192.168.1.20")
+        self.assertEqual(forwarded_ip("192.168.1.50", "1.2.3.4, 192.168.1.20"),
+                         "192.168.1.50")
         self.assertEqual(forwarded_ip("127.0.0.1"), "127.0.0.1")
+
+    def test_real_ip_wins_over_forwarded_for(self):
+        self.assertEqual(
+            forwarded_ip("::1", "1.2.3.4, 192.168.1.20", "192.168.1.21"),
+            "192.168.1.21")
+        self.assertEqual(forwarded_ip("127.0.0.1", "1.2.3.4, 192.168.1.20", "bad-ip"),
+                         "192.168.1.20")
 
 
 class IpAllowedTests(unittest.TestCase):

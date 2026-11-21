@@ -30,6 +30,14 @@ LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 
 LOG_LEVEL_DOC = "DEBUG / INFO / WARNING / ERROR / CRITICAL"
 
+# uvicorn 等第三方日志里的查询串也不能带票据；统一在格式化阶段打码。
+SENSITIVE_QUERY = re.compile(
+    r"\b(ticket|token|api_key|key)=([^&\s\"']+)", re.IGNORECASE)
+
+
+def redact_message(text: str) -> str:
+    return SENSITIVE_QUERY.sub(r"\1=***", text)
+
 
 @dataclass(frozen=True)
 class LogSettings:
@@ -89,7 +97,7 @@ class JsonFormatter(logging.Formatter):
                 timespec="milliseconds"),
             "level": record.levelname,
             "logger": record.name,
-            "message": record.getMessage(),
+            "message": redact_message(record.getMessage()),
         }
         # trace_id 在产出端由 TraceIdFilter 写进记录；队列监听线程没有请求上下文。
         trace_id = getattr(record, "trace_id", "") or TRACE_ID.get()
@@ -99,7 +107,7 @@ class JsonFormatter(logging.Formatter):
         if isinstance(fields, dict):
             payload.update(fields)
         if record.exc_info:
-            payload["exception"] = self.formatException(record.exc_info)
+            payload["exception"] = redact_message(self.formatException(record.exc_info))
         return json.dumps(payload, ensure_ascii=False, default=str)
 
 

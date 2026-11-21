@@ -10,7 +10,7 @@
 | [network-hardening.md](network-hardening.md) | **待评审** | API Key 过期/IP 白名单、CORS、WS 心跳三项方案 |
 | [router-refactor.md](router-refactor.md) | **已实现** | 拆 routers + 归属检查下沉，对外行为不变 |
 | [health-checks.md](health-checks.md) | **已实现 v1** | 主动探活 + 现有被动冷却，摘除坏上游 |
-| [cookie-sso.md](cookie-sso.md) | 未实现（已被本地账号会话部分覆盖） | 网关登录页 + 签名 Cookie，多个被代理工具统一登录 |
+| [cookie-sso.md](cookie-sso.md) | 已被本地账号方案取代（历史） | 网关登录页 + 签名 Cookie，多个被代理工具统一登录 |
 | [affinity.md](affinity.md) | 未实现 | Cookie / header / IP 亲和，让同一客户端固定到同一上游 |
 | [tcp-proxy.md](tcp-proxy.md) | 未实现（建议不做） | 非 HTTP 协议：gRPC 不可行，TCP 按需且建议外置 |
 
