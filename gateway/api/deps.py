@@ -101,12 +101,15 @@ async def authenticate(ctx: AppContext, request: Request,
     return await api_key_from_header(ctx, authorization)
 
 
-def enforce_csrf(request: Request, principal: dict) -> None:
+def enforce_csrf(ctx: AppContext, request: Request, principal: dict) -> None:
     """只有 Cookie 认证需要 CSRF；Bearer 头不会被浏览器自动带上。"""
     if principal["kind"] != "session" or request.method in SAFE_METHODS:
         return
     origin = request.headers.get("origin")
     if origin:
+        if origin.rstrip("/") in ctx.settings.cors_origins:
+            # 已配置的 CORS 来源同时视为 CSRF 可信来源；浏览器侧仍受 CORS 限制。
+            return
         from urllib.parse import urlsplit
         if urlsplit(origin).netloc != request.headers.get("host", ""):
             raise GatewayError(403, "csrf_rejected", "跨站请求被拒绝。")
@@ -136,7 +139,7 @@ async def require_auth(request: Request,
     if principal is None:
         raise GatewayError(401, "unauthorized",
                            "请先登录，或提供正确的 Authorization: Bearer <token>。")
-    enforce_csrf(request, principal)
+    enforce_csrf(ctx, request, principal)
     request.state.principal = principal
     if principal["kind"] == "api_key":
         enforce_scope(request, principal)

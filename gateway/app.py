@@ -20,7 +20,7 @@ from .auth import LoginLimiter
 from .config import Settings
 from .container import AppContext
 from .errors import GatewayError
-from .limits import BodyLimitMiddleware, SecurityHeadersMiddleware, UserLimiter
+from .limits import BodyLimitMiddleware, PathScopedCORS, SecurityHeadersMiddleware, UserLimiter
 from .logging_setup import LogSettings
 from .maintenance import audit_janitor, prune_audit
 from .metrics import Metrics, MetricsMiddleware
@@ -119,6 +119,10 @@ def create_app(settings: Settings | None = None,
         app.add_middleware(AccessLogMiddleware, settings=log_settings)
     app.add_middleware(MetricsMiddleware, metrics=ctx.metrics)
     app.add_middleware(SecurityHeadersMiddleware)
+    if settings.cors_origins:
+        # 最后添加 = 最外层：预检请求在鉴权之前就被处理。
+        app.add_middleware(PathScopedCORS, origins=settings.cors_origins,
+                           exempt_prefixes=tuple(route.prefix for route in ctx.routes))
 
     @app.exception_handler(GatewayError)
     async def handle_gateway_error(request: Request, error: GatewayError):

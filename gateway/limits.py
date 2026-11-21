@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 from starlette.datastructures import Headers
+from starlette.middleware.cors import CORSMiddleware
 
 from .errors import GatewayError
 
@@ -124,6 +125,32 @@ CONTENT_SECURITY_POLICY = (
     "img-src 'self' data:; connect-src 'self' ws: wss:; font-src 'self'; "
     "object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
 )
+
+
+class PathScopedCORS:
+    """只给网关自己的接口加 CORS；代理前缀交给上游，避免响应头重复。"""
+
+    def __init__(self, app, *, origins: tuple[str, ...],
+                 exempt_prefixes: tuple[str, ...] = ()) -> None:
+        self.app = app
+        self.exempt_prefixes = exempt_prefixes
+        self.cors = CORSMiddleware(
+            app,
+            allow_origins=list(origins),
+            allow_credentials=True,
+            allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+            allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
+            expose_headers=["X-Request-ID", "X-Proxy-Upstream"],
+            max_age=600,
+        )
+
+    async def __call__(self, scope, receive, send) -> None:
+        path = scope.get("path", "") if scope["type"] == "http" else ""
+        if scope["type"] == "http" and not any(path.startswith(prefix)
+                                               for prefix in self.exempt_prefixes):
+            await self.cors(scope, receive, send)
+        else:
+            await self.app(scope, receive, send)
 
 
 class SecurityHeadersMiddleware:

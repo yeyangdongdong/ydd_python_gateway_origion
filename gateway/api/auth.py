@@ -33,7 +33,11 @@ def build_auth_router(ctx: AppContext) -> APIRouter:
 
     def check_login_origin(request: Request) -> None:
         origin = request.headers.get("origin")
-        if origin and urlsplit(origin).netloc != request.headers.get("host", ""):
+        if not origin:
+            return
+        if origin.rstrip("/") in settings.cors_origins:
+            return
+        if urlsplit(origin).netloc != request.headers.get("host", ""):
             raise GatewayError(403, "csrf_rejected", "跨站登录请求被拒绝。")
 
     @router.post("/login")
