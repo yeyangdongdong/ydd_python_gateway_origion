@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 from fastapi.testclient import TestClient
 
@@ -129,6 +130,26 @@ class ApiKeyTests(unittest.TestCase):
         self.assertEqual(login.status_code, 303)
         denied = client.post("/api-keys", json={"name": "x", "scopes": ["sessions"]})
         self.assertEqual(denied.status_code, 403)
+
+    def test_ip_allowlist_accepts_and_rejects(self):
+        admin = self.admin_client()
+        created = self.create_key(admin, ["sessions"], name="ip-bound")
+        patched = admin.patch(f"/api-keys/{created['id']}",
+                              json={"allowed_cidrs": ["10.0.0.0/8"]})
+        self.assertEqual(patched.status_code, 200)
+        self.assertEqual(patched.json()["allowed_cidrs"], ["10.0.0.0/8"])
+        key = self.key_client(created["key"])
+
+        with mock.patch("gateway.api.deps.connection_ip", return_value="10.1.2.3"):
+            self.assertEqual(key.get("/sessions").status_code, 200)
+        with mock.patch("gateway.api.deps.connection_ip", return_value="192.168.1.5"):
+            self.assertEqual(key.get("/sessions").status_code, 401)
+
+    def test_invalid_cidr_is_rejected(self):
+        admin = self.admin_client()
+        response = admin.post("/api-keys", json={"name": "bad", "scopes": ["sessions"],
+                                                 "allowed_cidrs": ["not-a-cidr"]})
+        self.assertEqual(response.status_code, 422)
 
     def test_websocket_accepts_api_key(self):
         admin = self.admin_client()

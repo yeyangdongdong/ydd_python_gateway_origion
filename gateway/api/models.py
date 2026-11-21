@@ -57,6 +57,13 @@ class ApiKeyCreate(InputModel):
     scopes: list[str] = Field(default_factory=list, max_length=10)
     # 不传则用服务端默认天数；0 表示永不过期。
     expires_in_days: int | None = Field(default=None, ge=0, le=3650)
+    # 为空表示不限制来源 IP。
+    allowed_cidrs: list[str] | None = Field(default=None, max_length=20)
+
+
+class ApiKeyUpdate(InputModel):
+    name: Text | None = Field(default=None, max_length=100)
+    allowed_cidrs: list[str] | None = Field(default=None, max_length=20)
 
 
 class UserCreate(InputModel):

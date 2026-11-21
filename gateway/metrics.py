@@ -24,6 +24,7 @@ class Metrics:
         self.ws_connections = 0
         self.login_failures = 0
         self.audit_failures = 0
+        self.api_key_ip_rejections = 0
 
     def observe_http(self, method: str, status: int, seconds: float) -> None:
         with self._lock:
@@ -47,6 +48,10 @@ class Metrics:
         with self._lock:
             self.audit_failures += 1
 
+    def api_key_ip_rejected(self) -> None:
+        with self._lock:
+            self.api_key_ip_rejections += 1
+
     def render(self) -> str:
         lines = [
             "# HELP gateway_http_requests_total HTTP 请求数。",
@@ -59,6 +64,7 @@ class Metrics:
             ws = self.ws_connections
             login_failures = self.login_failures
             audit_failures = self.audit_failures
+            ip_rejections = self.api_key_ip_rejections
         for (method, status), value in requests:
             lines.append(
                 f'gateway_http_requests_total{{method="{_escape(method)}",'
@@ -82,6 +88,9 @@ class Metrics:
             "# HELP gateway_audit_failures_total 审计写入失败次数。",
             "# TYPE gateway_audit_failures_total counter",
             f"gateway_audit_failures_total {audit_failures}",
+            "# HELP gateway_api_key_ip_rejections_total API Key 因 IP 白名单被拒绝的次数。",
+            "# TYPE gateway_api_key_ip_rejections_total counter",
+            f"gateway_api_key_ip_rejections_total {ip_rejections}",
             "# HELP gateway_uptime_seconds 进程运行秒数。",
             "# TYPE gateway_uptime_seconds gauge",
             f"gateway_uptime_seconds {time.monotonic() - self.started:.1f}",

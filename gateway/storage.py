@@ -140,6 +140,9 @@ MIGRATIONS: list[tuple[int, tuple[str, ...]]] = [
         "CREATE INDEX IF NOT EXISTS sessions_owner ON sessions(owner_id)",
         "CREATE INDEX IF NOT EXISTS agents_owner ON agents(owner_id)",
     )),
+    (6, (
+        "ALTER TABLE api_keys ADD COLUMN allowed_cidrs TEXT",
+    )),
 ]
 
 
@@ -558,10 +561,26 @@ class Store:
         with self.connect() as db:
             db.execute("""
                 INSERT INTO api_keys (id, name, key_hash, key_prefix, scopes, owner_id,
-                                      expires_at, created_at, last_used_at, revoked_at)
+                                      expires_at, created_at, last_used_at, revoked_at,
+                                      allowed_cidrs)
                 VALUES (:id, :name, :key_hash, :key_prefix, :scopes, :owner_id,
-                        :expires_at, :created_at, NULL, NULL)
+                        :expires_at, :created_at, NULL, NULL, :allowed_cidrs)
             """, event)
+
+    def update_api_key(self, key_id: str, *, name: str | None = None,
+                       allowed_cidrs: str | None = None) -> dict:
+        changes = {column: value for column, value in
+                   (("name", name), ("allowed_cidrs", allowed_cidrs))
+                   if value is not None}
+        with self.connect() as db:
+            if self._row(db, "SELECT 1 FROM api_keys WHERE id = ?", key_id) is None:
+                raise GatewayError(404, "api_key_not_found", "API Key 不存在。")
+            if changes:
+                assignments = ", ".join(f"{column} = :{column}" for column in changes)
+                db.execute(f"UPDATE api_keys SET {assignments} WHERE id = :id",
+                           {**changes, "id": key_id})
+            row = db.execute("SELECT * FROM api_keys WHERE id = ?", (key_id,)).fetchone()
+        return dict(row)
 
     def find_api_key(self, key_id: str) -> dict | None:
         with self.connect() as db:
@@ -570,7 +589,7 @@ class Store:
 
     def list_api_keys(self, owner_id: str | None = None) -> list[dict]:
         query = ("SELECT id, name, key_prefix, scopes, owner_id, expires_at, created_at,"
-                 " last_used_at, revoked_at FROM api_keys")
+                 " last_used_at, revoked_at, allowed_cidrs FROM api_keys")
         parameters: tuple = ()
         if owner_id:
             query += " WHERE owner_id = ?"

@@ -18,7 +18,7 @@ from ..auth import (COOKIE_NAME, api_key_principal, hash_api_key, hash_token,
 from ..container import AppContext
 from ..errors import GatewayError
 from ..logging_setup import TRACE_ID
-from ..net import forwarded_ip
+from ..net import forwarded_ip, ip_allowed
 
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 logger = logging.getLogger(__name__)
@@ -61,7 +61,8 @@ async def session_from_cookie(ctx: AppContext, token: str | None) -> dict | None
     return session_principal(row)
 
 
-async def api_key_from_header(ctx: AppContext, authorization: str | None) -> dict | None:
+async def api_key_from_header(ctx: AppContext, authorization: str | None,
+                              client_ip: str) -> dict | None:
     if not authorization or not authorization.startswith("Bearer "):
         return None
     parsed = parse_api_key(authorization[7:].strip())
@@ -75,6 +76,11 @@ async def api_key_from_header(ctx: AppContext, authorization: str | None) -> dic
         return None
     current = datetime.now(timezone.utc)
     if row["expires_at"] and row["expires_at"] <= current.isoformat():
+        return None
+    allowed = json.loads(row.get("allowed_cidrs") or "[]")
+    if not ip_allowed(client_ip, allowed):
+        ctx.metrics.api_key_ip_rejected()
+        logger.warning("API key %s rejected from %s (IP not allowed)", key_id, client_ip)
         return None
     last_used = row["last_used_at"]
     if not last_used or (current - datetime.fromisoformat(last_used)).total_seconds() > 60:
@@ -91,14 +97,14 @@ async def authenticate(ctx: AppContext, request: Request,
     if settings.auth_mode == "legacy":
         if token_matches(settings, authorization) or legacy_open(settings):
             return legacy_principal()
-        return await api_key_from_header(ctx, authorization)
+        return await api_key_from_header(ctx, authorization, connection_ip(request))
     principal = await session_from_cookie(ctx, request.cookies.get(COOKIE_NAME))
     if principal is not None:
         return principal
     # 本地模式下旧的共享 token 仍可用（映射为管理员），方便脚本平滑迁移。
     if token_matches(settings, authorization):
         return legacy_principal()
-    return await api_key_from_header(ctx, authorization)
+    return await api_key_from_header(ctx, authorization, connection_ip(request))
 
 
 def enforce_csrf(ctx: AppContext, request: Request, principal: dict) -> None:
@@ -208,7 +214,8 @@ async def websocket_principal(ctx: AppContext, websocket: WebSocket,
     if legacy_open(settings) or token_matches(settings,
                                               websocket.headers.get("authorization")):
         return legacy_principal()
-    api = await api_key_from_header(ctx, websocket.headers.get("authorization"))
+    api = await api_key_from_header(ctx, websocket.headers.get("authorization"),
+                                    connection_ip(websocket))
     if api is not None:
         return api
     ticket = websocket.query_params.get("ticket")
@@ -217,11 +224,15 @@ async def websocket_principal(ctx: AppContext, websocket: WebSocket,
     return None
 
 
-def request_ip(request: Request) -> str:
+def connection_ip(connection) -> str:
     # Caddy 前置时对端是 127.0.0.1，真实 IP 在 X-Forwarded-For；只信任回环对端。
-    peer = request.client.host if request.client else ""
-    return forwarded_ip(peer, request.headers.get("x-forwarded-for"),
-                        request.headers.get("x-real-ip"))
+    peer = connection.client.host if connection.client else ""
+    return forwarded_ip(peer, connection.headers.get("x-forwarded-for"),
+                        connection.headers.get("x-real-ip"))
+
+
+def request_ip(request: Request) -> str:
+    return connection_ip(request)
 
 
 def audit_context(request: Request) -> dict:
