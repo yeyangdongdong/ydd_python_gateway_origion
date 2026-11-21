@@ -29,10 +29,12 @@ def build_chat_router(ctx: AppContext) -> APIRouter:
 
     @router.post("/sessions/{session_id}/chat", dependencies=auth)
     async def chat(session_id: str, data: ChatInput, request: Request):
-        await deps.session_for(ctx, request, session_id)
-        async with ctx.chat_limiter.slot(limiter_key(deps.principal_of(request))):
+        await deps.owned_session(ctx, request, session_id)
+        principal = deps.principal_of(request)
+        async with ctx.chat_limiter.slot(limiter_key(principal)):
             async with aclosing(ctx.chat.stream(
-                    session_id, data.content, data.request_id)) as events:
+                    session_id, data.content, data.request_id,
+                    owner_id=deps.owner_scope(principal))) as events:
                 async for event in events:
                     if event["type"] == "error":
                         # 与其它 HTTP 错误保持同一形状：{"error": {code, message}}，
@@ -59,8 +61,8 @@ def build_chat_router(ctx: AppContext) -> APIRouter:
         log_websocket("ws.connect", session_id=session_id, trace_id=trace_id,
                       path=websocket.url.path)
         try:
-            session = await run_in_threadpool(ctx.store.get_session, session_id)
-            deps.ensure_session_access(principal, session)
+            await run_in_threadpool(ctx.store.get_owned_session, session_id,
+                                    deps.owner_scope(principal))
         except GatewayError as error:
             await websocket.send_json(deps.ws_error(session_id, error))
             await websocket.close(code=1008)
@@ -81,7 +83,8 @@ def build_chat_router(ctx: AppContext) -> APIRouter:
                 try:
                     async with ctx.chat_limiter.slot(limiter_key(principal)):
                         async with aclosing(ctx.chat.stream(
-                            session_id, data.content, data.request_id
+                            session_id, data.content, data.request_id,
+                            owner_id=deps.owner_scope(principal)
                         )) as events:
                             async for event in events:
                                 await websocket.send_json(event)

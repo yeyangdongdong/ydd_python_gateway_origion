@@ -26,11 +26,14 @@ class ChatService:
         # 等待者和执行者持有强引用；没有请求时，锁会自动释放出字典。
         self.session_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
 
-    async def stream(self, session_id: str, content: str, request_id: str) -> AsyncIterator[dict]:
+    async def stream(self, session_id: str, content: str, request_id: str,
+                     *, owner_id: str | None) -> AsyncIterator[dict]:
+        """owner_id 由调用方从 principal 换算；None 表示管理员/服务级身份，不限制。"""
         lock = self.session_locks.setdefault(session_id, asyncio.Lock())
         async with lock:
             # 先排队再读取历史，后一轮才能看到前一轮的完整答案。
-            session = await run_in_threadpool(self.store.get_session, session_id)
+            session = await run_in_threadpool(self.store.get_owned_session,
+                                              session_id, owner_id)
             previous = await run_in_threadpool(self.store.find_request, session_id, request_id)
             if previous:
                 if previous["input"] != content:

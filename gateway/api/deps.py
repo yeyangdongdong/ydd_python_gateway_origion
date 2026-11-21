@@ -187,16 +187,11 @@ def owner_scope(principal: dict) -> str | None:
     return principal["user_id"] or None
 
 
-def ensure_session_access(principal: dict, session: dict) -> None:
-    # 用 404 而不是 403，避免暴露"别人的会话是否存在"。
-    if not owns(principal, session.get("owner_id")):
-        raise GatewayError(404, "session_not_found", "会话不存在。")
-
-
-async def session_for(ctx: AppContext, request: Request, session_id: str) -> dict:
-    session = await run_in_threadpool(ctx.store.get_session, session_id)
-    ensure_session_access(principal_of(request), session)
-    return session
+async def owned_session(ctx: AppContext, request: Request, session_id: str) -> dict:
+    """读会话并校验归属；所有会话级入口都必须经过这里。"""
+    principal = principal_of(request)
+    return await run_in_threadpool(ctx.store.get_owned_session, session_id,
+                                   owner_scope(principal))
 
 
 async def websocket_principal(ctx: AppContext, websocket: WebSocket,

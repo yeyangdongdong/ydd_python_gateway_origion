@@ -322,6 +322,16 @@ class Store:
             raise GatewayError(404, "session_not_found", "会话不存在，请先创建会话。")
         return dict(row)
 
+    def get_owned_session(self, session_id: str, owner_id: str | None) -> dict:
+        """owner_id 为 None 表示不限制（管理员/服务级 Key）；否则 owner 不匹配按 404。
+
+        这是归属检查的唯一实现：HTTP 路由与 ChatService 都走这里，避免某个入口漏检。
+        """
+        session = self.get_session(session_id)
+        if owner_id is not None and session.get("owner_id") != owner_id:
+            raise GatewayError(404, "session_not_found", "会话不存在，请先创建会话。")
+        return session
+
     def messages(self, session_id: str, *, completed_only: bool = False,
                  limit: int | None = None, offset: int = 0) -> list[dict]:
         """按写入顺序读取消息。limit=None 表示读取全部（模型上下文需要完整历史）。"""

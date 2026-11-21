@@ -1,8 +1,10 @@
 """阶段 5：资源归属、角色权限与代理 scope 的测试。"""
 
+import asyncio
 import json
 import tempfile
 import unittest
+from contextlib import aclosing
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -10,6 +12,7 @@ from fastapi.testclient import TestClient
 from gateway.app import create_app
 from gateway.auth import hash_password
 from gateway.config import Settings
+from gateway.errors import GatewayError
 from gateway.storage import Store
 
 
@@ -90,6 +93,24 @@ class OwnershipTests(unittest.TestCase):
             event = websocket.receive_json()
         self.assertEqual(event["type"], "error")
         self.assertEqual(event["error"]["code"], "session_not_found")
+
+    def test_chat_service_enforces_owner_when_called_directly(self):
+        alice = self.client("alice")
+        session = alice.post("/sessions", json={}).json()["id"]
+        user_id = alice.get("/auth/status").json()["user"]["id"]
+        chat = alice.app.state.ctx.chat
+
+        async def consume(owner_id):
+            async with aclosing(chat.stream(session, "直接调用", "req-direct",
+                                            owner_id=owner_id)) as events:
+                return [event["type"] async for event in events]
+
+        with self.assertRaises(GatewayError) as caught:
+            asyncio.run(consume("someone-else"))
+        self.assertEqual(caught.exception.status_code, 404)
+
+        self.assertEqual(asyncio.run(consume(user_id))[-1], "done")
+        self.assertEqual(asyncio.run(consume(None))[-1], "done")
 
     def test_proxy_required_scope(self):
         routes = self.root / "routes.json"
