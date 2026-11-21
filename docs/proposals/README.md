@@ -7,6 +7,7 @@
 
 | 提案 | 状态 | 一句话 |
 | --- | --- | --- |
+| [network-hardening.md](network-hardening.md) | **待评审** | API Key 过期/IP 白名单、CORS、WS 心跳三项方案 |
 | [router-refactor.md](router-refactor.md) | **已实现** | 拆 routers + 归属检查下沉，对外行为不变 |
 | [health-checks.md](health-checks.md) | **已实现 v1** | 主动探活 + 现有被动冷却，摘除坏上游 |
 | [cookie-sso.md](cookie-sso.md) | 未实现（已被本地账号会话部分覆盖） | 网关登录页 + 签名 Cookie，多个被代理工具统一登录 |
