@@ -55,7 +55,8 @@ class ProxyTicketInput(InputModel):
 class ApiKeyCreate(InputModel):
     name: Text = Field(max_length=100)
     scopes: list[str] = Field(default_factory=list, max_length=10)
-    expires_in_days: int | None = Field(default=None, ge=1, le=3650)
+    # 不传则用服务端默认天数；0 表示永不过期。
+    expires_in_days: int | None = Field(default=None, ge=0, le=3650)
 
 
 class UserCreate(InputModel):

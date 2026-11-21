@@ -1,6 +1,7 @@
 """管理员接口：API Key 管理与审计查询。"""
 
 import json
+import math
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Query, Request
@@ -12,6 +13,17 @@ from ..container import AppContext
 from ..errors import GatewayError
 from . import deps
 from .models import ApiKeyCreate
+
+
+def _days_left(expires_at: str | None) -> int | None:
+    if not expires_at:
+        return None
+    try:
+        remaining = (datetime.fromisoformat(expires_at)
+                     - datetime.now(timezone.utc)).total_seconds()
+    except ValueError:
+        return None
+    return max(0, math.ceil(remaining / 86400))
 
 
 def build_admin_router(ctx: AppContext) -> APIRouter:
@@ -47,6 +59,7 @@ def build_admin_router(ctx: AppContext) -> APIRouter:
         return [{"id": row["id"], "name": row["name"], "prefix": row["key_prefix"],
                  "scopes": json.loads(row["scopes"] or "[]"),
                  "owner_id": row["owner_id"], "expires_at": row["expires_at"],
+                 "days_left": _days_left(row["expires_at"]),
                  "created_at": row["created_at"], "last_used_at": row["last_used_at"],
                  "revoked": bool(row["revoked_at"])} for row in rows]
 
@@ -61,8 +74,9 @@ def build_admin_router(ctx: AppContext) -> APIRouter:
                                    "scope 只能是以字母开头的字母/数字/-/_/: 组合。")
         key_id, secret, plaintext = new_api_key()
         now = datetime.now(timezone.utc)
-        expires_at = ((now + timedelta(days=data.expires_in_days)).isoformat()
-                      if data.expires_in_days else None)
+        days = data.expires_in_days if data.expires_in_days is not None \
+            else ctx.settings.api_key_default_days
+        expires_at = (now + timedelta(days=days)).isoformat() if days > 0 else None
         principal = deps.principal_of(request)
         await run_in_threadpool(ctx.store.create_api_key, {
             "id": key_id, "name": data.name, "key_hash": hash_api_key(secret),
@@ -73,10 +87,11 @@ def build_admin_router(ctx: AppContext) -> APIRouter:
         await deps.record_audit(ctx, request, "api_key.create", target_type="api_key",
                                 target_id=key_id,
                                 details={"name": data.name,
-                                         "scopes": sorted(set(data.scopes))})
+                                         "scopes": sorted(set(data.scopes)),
+                                         "expires_at": expires_at})
         return {"id": key_id, "name": data.name, "key": plaintext,
                 "prefix": secret[:8], "scopes": sorted(set(data.scopes)),
-                "expires_at": expires_at}
+                "expires_at": expires_at, "days_left": _days_left(expires_at)}
 
     @router.delete("/api-keys/{key_id}", status_code=204, dependencies=auth)
     async def revoke_api_key(key_id: str, request: Request):

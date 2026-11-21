@@ -62,6 +62,13 @@ class Settings:
     # 每个用户的聊天并发与每分钟请求数。
     chat_concurrency: int = 3
     chat_per_minute: int = 60
+    # 新建 API Key 的默认有效天数；0 表示默认不过期。
+    api_key_default_days: int = 180
+    # 允许跨源访问的精确 origin 列表；空表示关闭 CORS。
+    cors_origins: tuple[str, ...] = ()
+    # WebSocket 协议层 ping 配置（0 表示关闭）。
+    ws_ping_interval: float = 20.0
+    ws_ping_timeout: float = 20.0
     # 审计表保留天数；文件保留由 GATEWAY_AUDIT_BACKUP_DAYS 控制，两者独立。
     audit_retention_days: int = 180
     # 备份目录与保留快照数。
@@ -102,11 +109,22 @@ class Settings:
         for name, value in (("GATEWAY_MAX_BODY_BYTES", self.max_body_bytes),
                             ("GATEWAY_CHAT_CONCURRENCY", self.chat_concurrency),
                             ("GATEWAY_CHAT_PER_MINUTE", self.chat_per_minute),
-                            ("GATEWAY_AUDIT_RETENTION_DAYS", self.audit_retention_days)):
-            if value <= 0:
-                raise ValueError(f"{name} 必须是正整数。")
+                            ("GATEWAY_AUDIT_RETENTION_DAYS", self.audit_retention_days),
+                            ("GATEWAY_API_KEY_DEFAULT_DAYS", self.api_key_default_days)):
+            if value < 0 or (value == 0 and name != "GATEWAY_API_KEY_DEFAULT_DAYS"):
+                raise ValueError(f"{name} 必须为正整数。")
         if self.backup_keep < 0:
             raise ValueError("GATEWAY_BACKUP_KEEP 不能为负数。")
+        for name, value in (("GATEWAY_WS_PING_INTERVAL", self.ws_ping_interval),
+                            ("GATEWAY_WS_PING_TIMEOUT", self.ws_ping_timeout)):
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} 必须是不小于 0 的有限数字。")
+        for origin in self.cors_origins:
+            parsed = urlsplit(origin)
+            if origin == "*" or parsed.scheme not in {"http", "https"} \
+                    or not parsed.netloc or parsed.path or parsed.query \
+                    or parsed.fragment or parsed.username or parsed.password:
+                raise ValueError(f"GATEWAY_CORS_ORIGINS 里的 origin 不合法：{origin}")
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -133,6 +151,12 @@ class Settings:
             chat_per_minute = int(os.getenv("GATEWAY_CHAT_PER_MINUTE", "60"))
             audit_retention = int(os.getenv("GATEWAY_AUDIT_RETENTION_DAYS", "180"))
             backup_keep = int(os.getenv("GATEWAY_BACKUP_KEEP", "14"))
+            api_key_days = int(os.getenv("GATEWAY_API_KEY_DEFAULT_DAYS", "180"))
+            ws_interval = float(os.getenv("GATEWAY_WS_PING_INTERVAL", "20"))
+            ws_timeout = float(os.getenv("GATEWAY_WS_PING_TIMEOUT", "20"))
+            cors_origins = tuple(
+                origin.strip().rstrip("/") for origin in
+                os.getenv("GATEWAY_CORS_ORIGINS", "").split(",") if origin.strip())
         except ValueError as exc:
             raise ValueError("模型与登录相关的数值配置必须为整数/数字。") from exc
         return cls(
@@ -162,4 +186,8 @@ class Settings:
             audit_retention_days=audit_retention,
             backup_dir=Path(os.getenv("GATEWAY_BACKUP_DIR", r"D:\Document\backup\logs")),
             backup_keep=backup_keep,
+            api_key_default_days=api_key_days,
+            cors_origins=cors_origins,
+            ws_ping_interval=ws_interval,
+            ws_ping_timeout=ws_timeout,
         )

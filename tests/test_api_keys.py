@@ -3,6 +3,7 @@
 import sqlite3
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -53,11 +54,25 @@ class ApiKeyTests(unittest.TestCase):
 
     def create_key(self, client, scopes, name="ci-key", days=None):
         body = {"name": name, "scopes": scopes}
-        if days:
+        if days is not None:
             body["expires_in_days"] = days
         response = client.post("/api-keys", json=body)
         self.assertEqual(response.status_code, 201, response.text)
         return response.json()
+
+    def test_default_expiry_and_explicit_never(self):
+        admin = self.admin_client()
+        default = self.create_key(admin, ["sessions"], name="default")
+        self.assertIsNotNone(default["expires_at"])
+        remaining = (datetime.fromisoformat(default["expires_at"])
+                     - datetime.now(timezone.utc)).total_seconds() / 86400
+        self.assertTrue(179 < remaining <= 180)
+
+        forever = self.create_key(admin, ["sessions"], name="forever", days=0)
+        self.assertIsNone(forever["expires_at"])
+        listed = {item["name"]: item for item in admin.get("/api-keys").json()}
+        self.assertIsNotNone(listed["default"]["days_left"])
+        self.assertIsNone(listed["forever"]["days_left"])
 
     def test_create_list_and_audit(self):
         client = self.admin_client()
