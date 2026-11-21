@@ -88,6 +88,7 @@
 | `gateway/auth.py` | 密码哈希、会话 token、登录限速、API Key、密码策略 | `hash_password`、`LoginLimiter`、`validate_password` | 不读 HTTP、不碰 Cookie |
 | `gateway/admin.py` | 命令行管理用户 | `main`、`create-user` / `set-role` / `disable-user` | 不启动服务 |
 | `gateway/limits.py` | 每用户聊天限流、请求体上限、安全响应头 | `UserLimiter`、`BodyLimitMiddleware`、`SecurityHeadersMiddleware` | 不做认证 |
+| `gateway/metrics.py` | HTTP/WS/登录/审计指标，Prometheus 文本 | `Metrics`、`MetricsMiddleware` | 不落盘、不做聚合服务 |
 | `gateway/net.py` | 只信任回环对端的 `X-Forwarded-For` / `X-Real-IP` | `forwarded_ip` | 不做 IP 封禁 |
 | `gateway/access_log.py` | 访问日志中间件：路径、参数摘要、脱敏、trace_id | `AccessLogMiddleware`、`redact` | 不改请求/响应内容 |
 | `gateway/logging_setup.py` | JSON 格式化、按类别/服务分文件、队列写盘、保留策略 | `LogSettings`、`setup_logging`、`DailyFileHandler` | 不决定"记什么"，只负责怎么记 |
@@ -602,16 +603,21 @@ httpx 的超时管"一段时间没有数据就断"，`asyncio.timeout` 管"这�
 - **文件生命周期**：`DailyFileHandler` 按天切分、超过 `GATEWAY_LOG_MAX_BYTES` 追加序号、按保留天数清理旧文件；
 - **关闭时**：`LoggingRuntime.stop()` 停监听线程并关闭句柄，避免 Windows 上文件被占住。
 
-可继续增强：`/metrics`（Prometheus）、OpenTelemetry trace——属于独立一层，不在当前范围。
+可继续增强：OpenTelemetry trace——属于独立一层，不在当前范围。
+`/metrics` 已提供 Prometheus 文本（HTTP 计数/耗时、WS 连接数、登录/审计失败、运行时长、版本）。
 
 ## 12. 性能与容量
 
-单轮请求的数据库操作（每次都是新连接上的短事务）：
+单轮请求的数据库操作（复用连接上的短事务）：
 
 ```text
 get_session → find_request → messages → start_run → complete_run/fail_run   ≈ 5~6 次
 ```
 
+- **连接复用**：服务进程用 `Store(path, pooled=True)`；同一时刻一个连接只借给一个调用方，
+  由锁保护。实测 200 次写入：新连接约 11.5 ms/次，复用后约 2.0 ms/次（Windows 本机）。
+- 池只为长驻服务进程启用；CLI、备份、测试里的临时 `Store` 仍是一操作一连接，
+  避免占住 SQLite 文件（Windows 上会阻止删除/移动）。
 - 历史是**全量读取后在内存裁剪**（O(n)），单会话数千条消息仍是毫秒级。
 - 单条消息上限 32,000 字符；`content` 需去除首尾空白后非空。
 - 消息写入是同步的，但只在 `start_run` / `complete_run` 两次，模型生成期间不占用写锁。

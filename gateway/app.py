@@ -23,6 +23,7 @@ from .errors import GatewayError
 from .limits import BodyLimitMiddleware, SecurityHeadersMiddleware, UserLimiter
 from .logging_setup import LogSettings
 from .maintenance import audit_janitor, prune_audit
+from .metrics import Metrics, MetricsMiddleware
 from .provider import ModelProvider
 from .proxy import Proxy, load_routes
 from .proxy_routes import build_proxy_router, register_forwarders
@@ -36,7 +37,7 @@ logger = logging.getLogger(__name__)
 def create_app(settings: Settings | None = None,
                log_settings: LogSettings | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
-    store = Store(settings.db_path)
+    store = Store(settings.db_path, pooled=True)
     ctx = AppContext(
         settings=settings,
         store=store,
@@ -48,6 +49,7 @@ def create_app(settings: Settings | None = None,
                                    lock_seconds=settings.login_lock_seconds),
         chat_limiter=UserLimiter(concurrency=settings.chat_concurrency,
                                  per_minute=settings.chat_per_minute),
+        metrics=Metrics(),
     )
 
     @asynccontextmanager
@@ -95,6 +97,7 @@ def create_app(settings: Settings | None = None,
             await provider.close()
             if ctx.proxy is not None:
                 await ctx.proxy.close()
+            ctx.store.close()
 
     app = FastAPI(title="ydd_python_gateway_origion", version="0.1.0",
                   description="易于理解的 Python Agent Gateway 基础版。", lifespan=lifespan)
@@ -106,6 +109,7 @@ def create_app(settings: Settings | None = None,
     if log_settings is not None and log_settings.enabled:
         app.state.log_settings = log_settings
         app.add_middleware(AccessLogMiddleware, settings=log_settings)
+    app.add_middleware(MetricsMiddleware, metrics=ctx.metrics)
     app.add_middleware(SecurityHeadersMiddleware)
 
     @app.exception_handler(GatewayError)

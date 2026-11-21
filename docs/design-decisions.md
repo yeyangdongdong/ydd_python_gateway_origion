@@ -470,6 +470,28 @@ Key 不能管理 Key；管理员可撤销；`last_used_at` 最多每分钟更新
 
 ---
 
+## ADR-021 连接池只给服务进程；指标手写 Prometheus 文本
+
+**背景**：每次数据库操作都新建连接，实测写入约 11.5 ms/次；同时缺少可抓取的运行指标。
+
+**决定**
+
+- `Store(path, pooled=True)` 只由 `create_app` 使用；连接借出/归还由锁保护，
+  `check_same_thread=False`（连接会在 anyio 线程间轮流使用），lifespan 结束时 `close()`；
+- CLI、备份、测试里的临时 `Store` 保持“一操作一连接”，避免 Windows 上 SQLite 文件被池占住；
+- `gateway/metrics.py` 手写 Prometheus 文本，不引入 `prometheus_client`；
+  HTTP 计数由中间件统计（含 4xx/5xx 与中间件直接生成的 413），WS/登录失败/审计失败由显式钩子累加；
+- `/metrics` 需要管理员会话，或带 `metrics` scope 的 API Key（Prometheus 用后者）。
+
+**后果**
+
+- 写入从约 11.5 ms/次降到约 2.0 ms/次（本机 200 次实测），认证每请求的会话查询也受益；
+- 池大小默认 8，超出时临时新建并在归还时关闭；池内连接是长事务串行的，WAL 下读仍并发；
+- 指标是进程内累计，重启清零；单进程部署不需要聚合，将来多进程要接 Prometheus 侧聚合；
+- 没有引入额外依赖，指标格式是手写契约，字段变更要同步 README。
+
+---
+
 ## 待定决策（已知但尚未做）
 
 | 主题 | 现状 | 若要做，建议 |

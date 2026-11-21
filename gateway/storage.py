@@ -5,6 +5,7 @@
 """
 
 import sqlite3
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -143,18 +144,58 @@ MIGRATIONS: list[tuple[int, tuple[str, ...]]] = [
 
 
 class Store:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, pooled: bool = False, pool_size: int = 8):
         self.path = path
+        self.pooled = pooled
+        self.pool_size = pool_size
+        self._pool: list[sqlite3.Connection] = []
+        self._pool_lock = threading.Lock()
+
+    def _new_connection(self) -> sqlite3.Connection:
+        # pooled 连接会在 anyio 的不同线程间轮流使用，因此放开线程检查；
+        # 同一时刻只会被一个调用方借用（由 _pool_lock 保证）。
+        connection = sqlite3.connect(self.path, timeout=5,
+                                     check_same_thread=not self.pooled)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        return connection
 
     @contextmanager
     def connect(self):
-        connection = sqlite3.connect(self.path, timeout=5)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
+        if not self.pooled:
+            connection = self._new_connection()
+            try:
+                with connection:
+                    yield connection
+            finally:
+                connection.close()
+            return
+
+        connection = self._borrow()
         try:
             with connection:
                 yield connection
         finally:
+            self._release(connection)
+
+    def _borrow(self) -> sqlite3.Connection:
+        with self._pool_lock:
+            if self._pool:
+                return self._pool.pop()
+        return self._new_connection()
+
+    def _release(self, connection: sqlite3.Connection) -> None:
+        with self._pool_lock:
+            if len(self._pool) < self.pool_size:
+                self._pool.append(connection)
+                return
+        connection.close()
+
+    def close(self) -> None:
+        """关闭池里的空闲连接；lifespan 结束时调用，避免 Windows 上占住文件。"""
+        with self._pool_lock:
+            pool, self._pool = self._pool, []
+        for connection in pool:
             connection.close()
 
     @staticmethod

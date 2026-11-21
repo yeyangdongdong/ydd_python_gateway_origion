@@ -6,6 +6,7 @@ from .audit import AuditTrail
 from .auth import LoginLimiter
 from .config import Settings
 from .limits import UserLimiter
+from .metrics import Metrics
 from .proxy import Proxy, ProxyRoute
 from .service import ChatService
 from .storage import Store
@@ -21,6 +22,7 @@ class AppContext:
     routes: list[ProxyRoute]
     login_limiter: LoginLimiter
     chat_limiter: UserLimiter
+    metrics: Metrics
     # 这两个在 lifespan 里创建，路由通过 ctx.chat / ctx.proxy 访问。
     chat: ChatService | None = None
     proxy: Proxy | None = None

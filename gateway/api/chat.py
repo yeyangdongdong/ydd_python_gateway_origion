@@ -58,6 +58,7 @@ def build_chat_router(ctx: AppContext) -> APIRouter:
             await websocket.close(code=1008)
             return
         await websocket.accept()
+        ctx.metrics.ws_opened()
         log_websocket("ws.connect", session_id=session_id, trace_id=trace_id,
                       path=websocket.url.path)
         try:
@@ -124,6 +125,7 @@ def build_chat_router(ctx: AppContext) -> APIRouter:
                     await websocket.close(code=1008, reason="Too many pending messages")
                     break
         finally:
+            ctx.metrics.ws_closed()
             worker.cancel()
             # 等待业务协程写完中断记录，避免连接的外层取消再次打断清理。
             with anyio.CancelScope(shield=True):

@@ -243,6 +243,7 @@ async def record_audit(ctx: AppContext, request: Request, action: str, *,
             target_type=target_type, target_id=target_id,
             details=details, result=result, reason=reason)
     except Exception:      # 审计是旁路：失败只记 ERROR，不改变业务结果
+        ctx.metrics.audit_failure()
         logger.exception("Audit append failed: %s", action)
 
 

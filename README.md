@@ -353,6 +353,8 @@ ydd_python_gateway_origion/
 │   ├── audit.py                # 审计双写（数据库 + 文件）
 │   ├── maintenance.py          # 审计保留期清理与每日巡检
 │   ├── backup.py               # 备份命令（日志按服务 + 数据库快照）
+│   ├── metrics.py              # /metrics 指标与 HTTP 计数中间件
+│   ├── limits.py               # 每用户限流、请求体上限、安全响应头
 │   ├── auth.py                 # 密码哈希、会话 token、登录限速
 │   ├── admin.py                # 命令行管理用户（python -m gateway.admin）
 │   ├── storage.py              # SQLite 表、迁移和读写操作
@@ -363,7 +365,7 @@ ydd_python_gateway_origion/
 │   ├── chat.html               # 内置浏览器聊天页（无外部依赖）
 │   └── login.html              # 登录页（local 认证模式）
 ├── docs/                       # 技术文档：架构、接口、决策、开发
-├── docs/proposals/             # 尚未实现的设计提案（健康检查已实现）
+├── docs/proposals/             # 设计提案（健康检查、路由重构已实现）
 ├── examples/                   # HTTP、WebSocket 与管理接口示例
 ├── tests/                      # 自动化测试
 ├── routes.json.example         # 反向代理路由模板
@@ -371,7 +373,7 @@ ydd_python_gateway_origion/
 └── requirements.txt            # Python 依赖
 ```
 
-建议先看 `run.py`，然后沿着 `app.py` 的聊天接口阅读 `service.py`；最后根据兴趣查看模型适配和数据库。增加新的模型服务时主要修改 `provider.py`；增加接口时在 `app.py` 连接已有业务逻辑。
+建议先看 `run.py` 和 `gateway/app.py` 的装配，再按资源读 `gateway/api/`；聊天链路继续看 `service.py`，最后看模型适配与数据库。增加接口时在 `api/` 下对应资源模块里加，鉴权与归属统一走 `api/deps.py`。
 
 更细的代码地图、每个文件的阅读顺序和常见改动步骤见 [docs/development.md](docs/development.md)；内部机制（排队、事务、状态机、错误分层）见 [docs/architecture.md](docs/architecture.md)。
 
@@ -564,6 +566,35 @@ D:\Document\backup\logs\2026-11-21_120000\
 - 数据库用 `sqlite3.Connection.backup` 复制，运行中也能得到一致快照；
 - 备份与清理都会写审计（`backup.create` / `audit.prune`）；
 - `GATEWAY_BACKUP_DIR` 可改备份根目录，`GATEWAY_BACKUP_KEEP` 控制保留快照数（`0` 表示不清理）。
+
+### 运行指标（`/metrics`）
+
+`GET /metrics` 输出 Prometheus 文本格式，需要**管理员**或带 `metrics` scope 的 API Key：
+
+| 指标 | 类型 | 含义 |
+| --- | --- | --- |
+| `gateway_http_requests_total{method,status}` | counter | 请求数（含 4xx/5xx） |
+| `gateway_http_request_duration_seconds_sum/count{method}` | summary | 累计耗时与次数 |
+| `gateway_ws_connections{kind="chat"}` | gauge | 当前聊天 WebSocket 连接数 |
+| `gateway_login_failures_total` | counter | 登录失败次数 |
+| `gateway_audit_failures_total` | counter | 审计写入失败次数 |
+| `gateway_uptime_seconds` | gauge | 进程运行秒数 |
+| `gateway_build_info{version}` | gauge | 版本信息 |
+
+Prometheus 抓取示例（API Key 只给 `metrics` scope）：
+
+```yaml
+scrape_configs:
+  - job_name: ydd-gateway
+    metrics_path: /metrics
+    authorization:
+      type: Bearer
+      credentials: ydd_xxxxxxxx_yyyyyyyy
+    static_configs:
+      - targets: ["127.0.0.1:8000"]
+```
+
+> 网关在 Caddy 后面时，把 target 换成 Caddy 的 https 地址，并在 Caddy 侧放行该路径。
 
 ## 12. 用户与认证（局域网多人）
 

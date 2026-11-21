@@ -4,6 +4,7 @@ import json
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Query, Request
+from fastapi.responses import PlainTextResponse
 from starlette.concurrency import run_in_threadpool
 
 from ..auth import hash_api_key, new_api_key
@@ -16,6 +17,17 @@ from .models import ApiKeyCreate
 def build_admin_router(ctx: AppContext) -> APIRouter:
     router = APIRouter()
     auth = [Depends(deps.require_auth)]
+
+    @router.get("/metrics", dependencies=auth, response_class=PlainTextResponse)
+    async def metrics(request: Request):
+        """Prometheus 文本格式；管理员或带 metrics scope 的 API Key 可读。"""
+        principal = deps.principal_of(request)
+        if principal["kind"] == "api_key":
+            if "metrics" not in principal["scopes"]:
+                raise GatewayError(403, "forbidden", "该 API Key 缺少权限：metrics")
+        elif principal["role"] != "admin":
+            raise GatewayError(403, "forbidden", "需要管理员权限。")
+        return PlainTextResponse(ctx.metrics.render())
 
     @router.get("/audit", dependencies=auth)
     async def list_audit(request: Request,

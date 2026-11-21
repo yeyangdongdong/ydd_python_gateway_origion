@@ -51,6 +51,7 @@ def build_auth_router(ctx: AppContext) -> APIRouter:
 
         retry_after = ctx.login_limiter.retry_after(ip, username)
         if retry_after:
+            ctx.metrics.login_failure()
             await deps.record_audit(ctx, request, "auth.login", result="failed",
                                     reason="locked",
                                     details={"username": username, "retry_after": retry_after})
@@ -61,6 +62,7 @@ def build_auth_router(ctx: AppContext) -> APIRouter:
                                               user["password_hash"] if user else DUMMY_HASH)
         if user is None or user["status"] != "active" or not password_ok:
             ctx.login_limiter.record_failure(ip, username)
+            ctx.metrics.login_failure()
             await deps.record_audit(ctx, request, "auth.login", result="failed",
                                     reason="invalid", details={"username": username})
             return RedirectResponse("/login?error=invalid", status_code=303)

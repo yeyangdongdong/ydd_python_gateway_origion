@@ -377,6 +377,14 @@ API Key 认证：`Authorization: Bearer ydd_<id>_<secret>`，按资源检查 sco
 登录后的浏览器请求自动携带 Cookie；脚本仍可用 `Authorization: Bearer <GATEWAY_TOKEN>`（映射为管理员）。
 Cookie 认证的非幂等请求（POST/PUT/PATCH/DELETE）需要同源的 `Origin` 或 `Sec-Fetch-Site`，否则 `403 csrf_rejected`。
 
+### 2.10 运行指标
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/metrics` | Prometheus 文本；仅管理员会话或带 `metrics` scope 的 API Key |
+
+包含请求计数/耗时、WS 连接数、登录失败数、审计失败数、运行时长与版本。
+
 ## 3. WebSocket 协议
 
 ### 3.1 连接
